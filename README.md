@@ -17,6 +17,36 @@ The current catalog enables **112 combinations: eight forms at levels 5, 10, 15,
 
 The other 26 standard branches have disabled preview records. Runed Gargoyle, complete family unlock progression, three AA groups, death/resurrection settlement and native transformation without zoning remain unfinished. See [known gaps](docs/KNOWN-GAPS.md) before deployment. Ordinary enabled forms have no GM-only gate.
 
+## Opcodes and structures
+
+The package documents **15 mapped Spirit Shroud messages** for the May 10, 2013 RoF2 client:
+
+| Message | Opcode | Direction | Current use |
+| --- | --- | --- | --- |
+| Selection | 0x2ec3 | S→C | Keeper and delimited selection tree |
+| Request | 0x2b37 | C→S | Selected template details request |
+| Details | 0x6c04 | S→C | Template header and caret-delimited preview |
+| Select | 0x1cd0 | C→S | Confirm selected template |
+| Cancel | 0x79da | C→S | Close/reset keeper menu |
+| ProgressAppend | 0x3823 | S→C | Native progression message family; full threshold behavior unfinished |
+| ProgressReplace | 0x541d | S→C | Progress display refresh; percentage remains provisional |
+| AbilityRequest | 0x3acc | C→S | Ability-preview cache request |
+| AbilityReady | 0x006e | S→C | Ability-preview ready signal |
+| EquipmentRequest | 0x4b25 | C→S | Equipment cache request |
+| Equipment | 0x2507 | S→C | Native item preview |
+| Transform | 0x6562 | S→C | Recovered mapping; native in-place flow not implemented |
+| Bank | 0x7b71 | Both | Bank action envelope |
+| BankItems | 0x1115 | S→C | Available earned items |
+| BankEmpty | 0x0728 | S→C | Empty-bank notification |
+
+- [Opcode inventory, directions and implementation status](protocol/OPCODES.md)
+- [Packet structures, field layouts and native transform envelope](protocol/STRUCTS.md)
+- [Machine-readable opcode mappings](protocol/opcodes.json)
+- [Recovery evidence and compatibility limits](protocol/EVIDENCE.md)
+- Production serializers: [wire.h](overlay/common/shroud/wire.h), [native_stats.h](overlay/common/shroud/native_stats.h) and [aa_preview.h](overlay/common/shroud/aa_preview.h)
+
+The `0x6562` transformation mapping is recovered, but its native in-place flow remains unfinished. The empty `0x7786` completion acknowledgement is documented as a candidate and is not mapped or handled by this release. Monster AA operations reuse the existing AA packet families. A mapping alone does not establish complete gameplay support.
+
 ## Exact source dependencies
 
 Apply in order:
