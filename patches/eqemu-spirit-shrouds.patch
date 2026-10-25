@@ -1,0 +1,1516 @@
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -870,6 +870,7 @@
+ IF (UNIX)
+     SET_SOURCE_FILES_PROPERTIES("SocketLib/Mime.cpp" PROPERTY COMPILE_FLAGS -Wno-unused-result)
+     SET_SOURCE_FILES_PROPERTIES("patches/sod.cpp" "patches/sof.cpp" "patches/rof.cpp" "patches/rof2.cpp" "patches/uf.cpp" PROPERTIES COMPILE_FLAGS -O0)
++    SET_SOURCE_FILES_PROPERTIES("patches/sod.cpp" "patches/sof.cpp" "patches/rof.cpp" "patches/rof2.cpp" "patches/uf.cpp" PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+ ENDIF (UNIX)
+ 
+ IF (EQEMU_BUILD_PCH)
+--- a/common/dbcore.cpp
++++ b/common/dbcore.cpp
+@@ -101,6 +101,7 @@
+ 	// Reconnect if we are not connected before hand.
+ 	if ((mysqlOwner && pStatus != Connected && !Open()) || !mysql ||
+ 		(!mysqlOwner && mysql_thread_id(mysql) == 0)) {
++		++m_query_failure_generation;
+ 		pStatus = Error;
+ 		auto errorBuffer = new char[MYSQL_ERRMSG_SIZE];
+ 		snprintf(errorBuffer, MYSQL_ERRMSG_SIZE, "Database connection could not be opened");
+@@ -109,6 +110,7 @@
+ 
+ 	// request query. != 0 indicates some kind of error.
+ 	if (mysql_real_query(mysql, query, querylen) != 0) {
++		++m_query_failure_generation;
+ 		unsigned int errorNumber = mysql_errno(mysql);
+ 
+ 		if (errorNumber == CR_SERVER_GONE_ERROR) {
+@@ -155,6 +157,12 @@
+ 
+ 	// successful query. get results.
+ 	MYSQL_RES *res     = mysql_store_result(mysql);
++	if (!res && mysql_field_count(mysql) != 0) {
++		++m_query_failure_generation;
++		auto errorBuffer = new char[MYSQL_ERRMSG_SIZE];
++		snprintf(errorBuffer, MYSQL_ERRMSG_SIZE, "Could not buffer database result");
++		return MySQLRequestResult(nullptr, 0, 0, 0, 0, mysql_errno(mysql), errorBuffer);
++	}
+ 	uint32    rowCount = 0;
+ 
+ 	if (res != nullptr) {
+--- a/common/dbcore.h
++++ b/common/dbcore.h
+@@ -13,6 +13,7 @@
+ #include <mysql.h>
+ #include <string.h>
+ #include <mutex>
++#include <atomic>
+ 
+ #define CR_SERVER_GONE_ERROR    2006
+ #define CR_SERVER_LOST          2013
+@@ -28,6 +29,8 @@
+ 	DBcore();
+ 	~DBcore();
+ 	eStatus GetStatus() { return pStatus; }
++	// Includes transient query failures even when the normal retry succeeds.
++	uint64_t QueryFailureGeneration() const { return m_query_failure_generation.load(); }
+ 	MySQLRequestResult QueryDatabase(const char *query, uint32 querylen, bool retryOnFailureOnce = true);
+ 	MySQLRequestResult QueryDatabase(const std::string& query, bool retryOnFailureOnce = true);
+ 	MySQLRequestResult QueryDatabaseMulti(const std::string &query);
+@@ -80,6 +83,7 @@
+ 	eStatus pStatus;
+ 
+ 	std::mutex m_query_lock{};
++	std::atomic<uint64_t> m_query_failure_generation{0};
+ 
+ 	std::string origin_host;
+ 
+--- a/common/emu_oplist.h
++++ b/common/emu_oplist.h
+@@ -709,3 +709,20 @@
+ N(OP_GuildTrophyModify),
+ 
+ N(OP_GuildTrophyOptIn),
++
++// Matching May 10 2013 RoF2 Spirit Shroud protocol.
++N(OP_SpiritShroudSelection),
++N(OP_SpiritShroudRequest),
++N(OP_SpiritShroudDetails),
++N(OP_SpiritShroudSelect),
++N(OP_SpiritShroudCancel),
++N(OP_SpiritShroudProgressAppend),
++N(OP_SpiritShroudProgressReplace),
++N(OP_SpiritShroudAbilityRequest),
++N(OP_SpiritShroudAbilityReady),
++N(OP_SpiritShroudEquipmentRequest),
++N(OP_SpiritShroudEquipment),
++N(OP_SpiritShroudTransform),
++N(OP_SpiritShroudBank),
++N(OP_SpiritShroudBankItems),
++N(OP_SpiritShroudBankEmpty),
+--- a/common/eq_packet_structs.h
++++ b/common/eq_packet_structs.h
+@@ -1129,6 +1129,11 @@
+ /*19564*/	uint32				RestTimer;
+ /*19568*/	uint32				char_id;			// Found as part of bazaar revamp (5/15/2024)
+ 
++	// Server-only alternate profile metadata; patch encoders select its wire fields.
++	bool shroud_native_stats_valid{};
++	bool shroud_native_resources_valid{};
++	uint32 shroud_native_stats[18]{};
++
+ 	// All player profile packets are translated and this overhead is ignored in out-bound packets
+ 	PlayerProfile_Struct() : m_player_profile_version(EQ::versions::MobVersion::Unknown) { }
+ 
+--- a/common/patches/rof2.cpp
++++ b/common/patches/rof2.cpp
+@@ -1,3 +1,4 @@
++#include "../shroud/native_stats.h"
+ #include "../mercenary/rof2_wire.h"
+ #include "../housing/plot_find_wire.h"
+ #include "../housing/npc_item_metadata.h"
+@@ -70,6 +71,18 @@
+ 			return true;
+ 		}
+ 	}
++
++ std::optional<std::vector<uint8_t>> SerializeShroudPreviewItem(const EQ::ItemInstance &instance)
++ {
++  if(!instance.GetUnscaledItem() || instance.GetMerchantSlot())return std::nullopt;
++  std::unique_ptr<EQ::ItemInstance> root(instance.Clone());
++  if(!root)return std::nullopt;
++  if(root->IsClassBag())root->Clear();
++  EQ::OutBuffer buffer;
++  SerializeItem(buffer,root.get(),EQ::invslot::slotCursor,0,ItemPacketViewLink);
++  if(!buffer.good() || !buffer.size() || buffer.size()>65535)return std::nullopt;
++  const auto bytes=buffer.str();return std::vector<uint8_t>(bytes.begin(),bytes.end());
++ }
+ 
+ 	std::optional<std::vector<uint8_t>> SerializeHousingItem(
+ 		const EQ::ItemInstance &instance, int16_t server_slot)
+@@ -1996,6 +2009,25 @@
+ 		FINISH_ENCODE();
+ 	}
+ 
++	// RoF2 uses the same spawn/current/maximum layout for all three resources.
++	ENCODE(OP_ManaUpdate)
++	{
++		SETUP_DIRECT_ENCODE(ManaUpdate_Struct, structs::SpawnHPUpdate_Struct);
++		eq->spawn_id = emu->spawn_id;
++		eq->cur_hp = emu->cur_mana;
++		eq->max_hp = emu->max_mana;
++		FINISH_ENCODE();
++	}
++
++	ENCODE(OP_EnduranceUpdate)
++	{
++		SETUP_DIRECT_ENCODE(EnduranceUpdate_Struct, structs::SpawnHPUpdate_Struct);
++		eq->spawn_id = emu->spawn_id;
++		eq->cur_hp = emu->cur_end;
++		eq->max_hp = emu->max_end;
++		FINISH_ENCODE();
++	}
++
+ 	ENCODE(OP_Illusion)
+ 	{
+ 		ENCODE_LENGTH_EXACT(Illusion_Struct);
+@@ -2473,8 +2505,8 @@
+ 		outapp->WriteUInt32(0);		// Checksum, we will update this later
+ 		outapp->WriteUInt32(0);		// Checksum size, we will update this later
+ 
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
++		outapp->WriteUInt32(emu->unknown0112 ? 1 : 0); // Main=0, Alt shroud=1
++		outapp->WriteUInt32(emu->unknown0112); // Spirit Shroud template ID
+ 
+ 
+ 		outapp->WriteUInt8(emu->gender);	// Gender
+@@ -2847,30 +2879,36 @@
+ 		}
+ 
+ 		outapp->WriteSInt32(-1);	// Unknown;
+-		outapp->WriteSInt32(123);	// HP Total ?
+-		outapp->WriteSInt32(234);	// Endurance Total ?
+-		outapp->WriteSInt32(345);	// Mana Total ?
+-
+-		// these are needed to fix display bugs
+-		outapp->WriteUInt32(0x19);		// base CR
+-		outapp->WriteUInt32(0x19);		// base FR
+-		outapp->WriteUInt32(0x19);		// base MR
+-		outapp->WriteUInt32(0xf);		// base DR
+-		outapp->WriteUInt32(0xf);		// base PR
+-		outapp->WriteUInt32(0xf);		// base PhR?
+-		outapp->WriteUInt32(0xf);		// base Corrup
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
+-
+-		outapp->WriteUInt32(20);	// Unknown - Expansion count ?
+-
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
+-		outapp->WriteUInt32(0);		// Unknown
++		if (emu->unknown0112 && emu->shroud_native_resources_valid) {
++			for (auto value : SpiritShroud::NativeStatTail(emu->shroud_native_stats)) {
++				outapp->WriteUInt32(value);
++			}
++		} else {
++			outapp->WriteSInt32(123);	// HP Total ?
++			outapp->WriteSInt32(234);	// Endurance Total ?
++			outapp->WriteSInt32(345);	// Mana Total ?
++
++			// these are needed to fix display bugs
++			outapp->WriteUInt32(0x19);		// base CR
++			outapp->WriteUInt32(0x19);		// base FR
++			outapp->WriteUInt32(0x19);		// base MR
++			outapp->WriteUInt32(0xf);		// base DR
++			outapp->WriteUInt32(0xf);		// base PR
++			outapp->WriteUInt32(0xf);		// base PhR?
++			outapp->WriteUInt32(0xf);		// base Corrup
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++
++			outapp->WriteUInt32(20);	// Unknown - Expansion count ?
++
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++			outapp->WriteUInt32(0);		// Unknown
++		}
+ 		outapp->WriteUInt32(emu->endurance);
+ 		outapp->WriteUInt32(0);		// Unknown - Observed 0x7cde - This is also seen in guild packets sent to this character.
+ 		outapp->WriteUInt32(0);		// Unknown - Observed 0x64
+@@ -3467,7 +3505,7 @@
+ 		outapp->WriteUInt32(emu->charges);
+ 		outapp->WriteSInt32(emu->expansion);
+ 		outapp->WriteSInt32(emu->category);
+-		outapp->WriteUInt8(0); // shroud
++		outapp->WriteUInt8(emu->category == 3 || emu->category == 4); // native shroud ability flag
+ 		outapp->WriteUInt8(0); // unknown109
+ 		outapp->WriteUInt8(0); // loh
+ 		outapp->WriteUInt8(0); // unknown111
+--- a/common/patches/rof2.h
++++ b/common/patches/rof2.h
+@@ -37,6 +37,9 @@
+ 	//these are the only public member of this namespace.
+ 	extern void Register(EQStreamIdentifier &into);
+ 	extern void Reload();
++ // Shroud inspection cache entry: native ItemPtr without an ItemPacket type
++ // or inventory count. This service has no housing rule dependency.
++ std::optional<std::vector<uint8_t>> SerializeShroudPreviewItem(const EQ::ItemInstance &instance);
+ 	// Native embedded ItemPtr, without the OP_ItemPacket type DWORD. Uses the
+ 	// ordinary item encoder and preserves instance identity, charges and children.
+ 	// Housing must be enabled. Full inventory trees and compact estate list
+--- a/common/patches/rof2_ops.h
++++ b/common/patches/rof2_ops.h
+@@ -87,6 +87,8 @@
+ E(OP_GuildsList)
+ E(OP_GuildTributeDonateItem)
+ E(OP_HPUpdate)
++E(OP_ManaUpdate)
++E(OP_EnduranceUpdate)
+ E(OP_Illusion)
+ E(OP_InspectBuffs)
+ E(OP_InspectRequest)
+--- a/common/ruletypes.h
++++ b/common/ruletypes.h
+@@ -39,6 +39,8 @@
+ 
+ 
+ RULE_CATEGORY(Character)
++RULE_BOOL(Character, EnableSpiritShrouds, false, "Enable transactional RoF2 Spirit Shrouds after applying shroud migrations")
++RULE_BOOL(Character, AllowTestSpiritShrouds, true, "Allow the separately marked starter Spirit Shroud catalog while Live content research is incomplete")
+ RULE_INT(Character, MaxLevel, 65, "Sets the highest level for players that can be reached through experience")
+ RULE_BOOL(Character, PerCharacterQglobalMaxLevel, false, "Check for qglobal 'CharMaxLevel' character qglobal (Type 5, \"\"), if player tries to level beyond that point, it will not go beyond that level")
+ RULE_BOOL(Character, PerCharacterBucketMaxLevel, false, "Check for data bucket 'CharMaxLevel', if player tries to level beyond that point, it will not go beyond that level")
+--- a/utils/patches/patch_RoF2.conf
++++ b/utils/patches/patch_RoF2.conf
+@@ -849,3 +849,20 @@
+ OP_MercenaryCostUpdate=0x3cbc
+ OP_MercenaryCurrencyMessage=0x29ec
+ OP_MercenaryTimerUpdate=0x2b4f
++
++# Spirit Shrouds
++OP_SpiritShroudSelection=0x2ec3
++OP_SpiritShroudRequest=0x2b37
++OP_SpiritShroudDetails=0x6c04
++OP_SpiritShroudSelect=0x1cd0
++OP_SpiritShroudCancel=0x79da
++OP_SpiritShroudProgressAppend=0x3823
++OP_SpiritShroudProgressReplace=0x541d
++OP_SpiritShroudAbilityRequest=0x3acc
++OP_SpiritShroudAbilityReady=0x006e
++OP_SpiritShroudEquipmentRequest=0x4b25
++OP_SpiritShroudEquipment=0x2507
++OP_SpiritShroudTransform=0x6562
++OP_SpiritShroudBank=0x7b71
++OP_SpiritShroudBankItems=0x1115
++OP_SpiritShroudBankEmpty=0x0728
+--- a/world/worlddb.cpp
++++ b/world/worlddb.cpp
+@@ -134,6 +134,15 @@
+ 		cse->Level       = e.level;
+ 		cse->ShroudClass = cse->Class;
+ 		cse->ShroudRace  = cse->Race;
++        // Character-select identity remains the original playable race/class;
++        // native RoF2 carries the temporary monster appearance separately.
++        if (client_version==EQ::versions::ClientVersion::RoF2 && DoesTableExist("spirit_shroud_state")) {
++            auto original=QueryDatabase("SELECT o.race,o.class,o.level FROM spirit_shroud_state s JOIN shroud_original_character_data o ON o.id=s.character_id WHERE s.template_id<>0 AND s.character_id="+std::to_string(character_id),false);
++            if(original.Success() && original.RowCount()==1) {
++                auto row=original.begin();cse->Race=uint32_t(std::stoul(row[0]));cse->Class=uint8_t(std::stoul(row[1]));cse->Level=uint8_t(std::stoul(row[2]));
++            }
++        }
++
+ 		cse->Zone        = e.zone_id;
+ 		cse->Instance    = 0;
+ 		cse->Gender      = e.gender;
+--- a/zone/CMakeLists.txt
++++ b/zone/CMakeLists.txt
+@@ -16,6 +16,7 @@
+     botspellsai.cpp
+     cheat_manager.cpp
+     client.cpp
++    client_spirit_shroud.cpp
+     client_evolving_items.cpp
+     fellowship_campfire.cpp
+     fellowship_campsite_bonuses.cpp
+--- a/zone/aa.cpp
++++ b/zone/aa.cpp
+@@ -17,6 +17,7 @@
+ */
+ 
+ #include "../common/classes.h"
++#include "../common/shroud/aa_preview.h"
+ #include "../common/global_define.h"
+ #include "../common/eqemu_logsys.h"
+ #include "../common/eq_packet_structs.h"
+@@ -518,6 +519,8 @@
+ 
+ void Client::ResetAA()
+ {
++	if (IsSpiritShrouded()) return;
++
+ 	SendClearPlayerAA();
+ 	RefundAA();
+ 
+@@ -839,6 +842,8 @@
+ }
+ 
+ void Client::RefundAA() {
++	if (IsSpiritShrouded()) return;
++
+ 	int refunded = 0;
+ 
+ 	auto rank_value = aa_ranks.begin();
+@@ -898,7 +903,54 @@
+ 
+ //New AA
+ void Client::SendAlternateAdvancementTable() {
++ if(!zone)return;
++ if(ClientVersion()==EQ::versions::ClientVersion::RoF2){
++  const auto* form=IsSpiritShrouded()?SpiritShroudDefinition():nullptr;
++  for(const auto& entry:zone->aa_ranks){
++   const auto* rank=entry.second.get();
++   if(!SpiritShroud::HideCachedRank(form,rank))continue;
++   const auto* ability=rank->base_ability;
++   // Matching-client eligibility always tests the class mask. A regular
++   // same-ID definition supersedes its cached predecessor; omission does not.
++   // Hide only Monster definitions, leaving every ordinary AA untouched.
++   EQApplicationPacket hidden(OP_SendAATable,sizeof(AARankInfo_Struct));
++   auto* definition=reinterpret_cast<AARankInfo_Struct*>(hidden.pBuffer);
++   *definition={};
++   definition->id=rank->id;
++   definition->upper_hotkey_sid=rank->upper_hotkey_sid;
++   definition->lower_hotkey_sid=rank->lower_hotkey_sid;
++   definition->title_sid=rank->title_sid;
++   definition->desc_sid=rank->desc_sid;
++   definition->level_req=rank->level_req;
++   definition->cost=rank->cost;
++   definition->seq=ability->id;
++   definition->current_level=rank->current_value;
++   definition->max_level=rank->current_value;
++   definition->type=ability->type;
++   definition->spell=rank->spell;
++   definition->spell_type=rank->spell_type;
++   definition->spell_refresh=rank->recast_time;
++   definition->classes=0;
++   definition->prev_id=-1;
++   definition->next_id=-1;
++   definition->total_cost=rank->total_cost;
++   definition->expansion=rank->expansion;
++   definition->category=ability->category;
++   definition->charges=ability->charges;
++   definition->grant_only=ability->grant_only;
++   QueuePacket(&hidden);
++  }
++ }
+ 	for(auto &aa : zone->aa_abilities) {
++		if (IsSpiritShrouded()) {
++			// Saved Monster AA sets contain the highest owned rank ID. A fresh
++			// client must know that rank before Load can request its missing
++			// chain, even when no rank in the chain is currently owned.
++			for (auto* rank = aa.second->first; rank && HasSpiritShroudRank(rank->id); rank = rank->next) {
++				SendAlternateAdvancementRank(aa.first, rank->current_value);
++			}
++			continue;
++		}
+ 		uint32 charges = 0;
+ 		auto ranks = GetAA(aa.second->first_rank_id, &charges);
+ 		if(ranks) {
+@@ -914,7 +966,7 @@
+ 	}
+ }
+ 
+-void Client::SendAlternateAdvancementRank(int aa_id, int level) {
++void Client::SendAlternateAdvancementRank(int aa_id, int level, const SpiritShroud::Template* shroud_preview) {
+ 	if(!zone)
+ 		return;
+ 
+@@ -922,15 +974,23 @@
+ 	auto ability = ability_rank.first;
+ 	auto rank = ability_rank.second;
+ 
+-	if(!ability) {
+-		return;
+-	}
+-
+-	if(!(ability->classes & (1 << GetClass()))) {
+-		return;
+-	}
+-
+-	if(!CanUseAlternateAdvancementRank(rank)) {
++	if(!ability || !rank) {
++		return;
++	}
++
++ // Both the selection preview and an active form advertise the same bounded
++ // rank chain. A normal character retains the ordinary AA serialization path.
++ const auto* shroud_form = shroud_preview ? shroud_preview :
++  (IsSpiritShrouded() ? SpiritShroudDefinition() : nullptr);
++ auto preview_range = shroud_form ? SpiritShroud::PreviewRange(*shroud_form, rank) : SpiritShroud::PreviewRankRange{};
++ if(shroud_form && (!preview_range.valid || !SpiritShroud::EnumerableRank(rank->id))) return;
++
++	if(!shroud_preview && !(ability->classes & (1 << GetClass()))) {
++		return;
++	}
++
++	if((!shroud_preview && !CanUseAlternateAdvancementRank(rank)) ||
++ (shroud_preview && ability->category!=AACategory::ShroudPassive && ability->category!=AACategory::ShroudActive)) {
+ 		return;
+ 	}
+ 
+@@ -952,15 +1012,21 @@
+ 	aai->classes = ability->classes;
+ 	aai->level_req = rank->level_req;
+ 	aai->current_level = level;
+-	aai->max_level = ability->GetMaxLevel(this);
+-	aai->prev_id = rank->prev_id;
+-
+-	if((rank->next && !CanUseAlternateAdvancementRank(rank->next)) || ability->charges > 0) {
++ const auto* captured = shroud_form ? SpiritShroud::CapturedPresentation(*shroud_form,rank) : nullptr;
++	aai->max_level = shroud_form ? preview_range.maximum : ability->GetMaxLevel(this);
++	aai->prev_id = shroud_form ? preview_range.previous : rank->prev_id;
++ if(captured){aai->current_level=captured->current;aai->max_level=captured->maximum;}
++
++	if(ability->charges > 0) {
++		aai->next_id = -1;
++ } else if(shroud_form) {
++  aai->next_id = preview_range.next;
++ } else if(rank->next && !CanUseAlternateAdvancementRank(rank->next)) {
+ 		aai->next_id = -1;
+ 	} else {
+ 		aai->next_id = rank->next_id;
+ 	}
+-	aai->total_cost = rank->total_cost;
++	aai->total_cost = captured ? captured->total_cost : rank->total_cost;
+ 	aai->expansion = rank->expansion;
+ 	aai->category = ability->category;
+ 	aai->charges = ability->charges;
+@@ -1008,6 +1074,9 @@
+ 			if(rank) {
+ 				aa2->aa_list[i].AA = rank->id;
+ 				aa2->aa_list[i].value = rank->total_cost;
++    const auto* form=IsSpiritShrouded()?SpiritShroudDefinition():nullptr;
++    const auto* captured=form?SpiritShroud::CapturedPresentation(*form,rank):nullptr;
++    if(captured)aa2->aa_list[i].value=captured->total_cost;
+ 				aa2->aa_list[i].charges = charges;
+ 				i++;
+ 			}
+@@ -1107,6 +1176,11 @@
+ }
+ 
+ void Client::PurchaseAlternateAdvancementRank(int rank_id) {
++	if (IsSpiritShrouded()) {
++		PurchaseSpiritShroudRank(rank_id, false);
++		return;
++	}
++
+ 	AA::Rank *rank = zone->GetAlternateAdvancementRank(rank_id);
+ 	if(!rank) {
+ 		return;
+@@ -1124,6 +1198,8 @@
+ }
+ 
+ bool Client::GrantAlternateAdvancementAbility(int aa_id, int points, bool ignore_cost) {
++	if (IsSpiritShrouded()) return false;
++
+ 	bool ret = false;
+ 	for(int i = 1; i <= points; ++i) {
+ 		auto ability_rank = zone->GetAlternateAdvancementAbilityAndRank(aa_id, i);
+@@ -1150,6 +1226,8 @@
+ }
+ 
+ void Client::FinishAlternateAdvancementPurchase(AA::Rank *rank, bool ignore_cost, bool send_message_and_save) {
++	if (IsSpiritShrouded()) return;
++
+ 	auto rank_id = rank->base_ability->first_rank_id;
+ 
+ 	if (rank->base_ability->charges) {
+@@ -1281,6 +1359,15 @@
+ 	// We don't have the AA
+ 	if (!GetAA(rank_id, &charges))
+ 		return;
++ // GetAA resolves any rank ID to the owned ability. It does not establish
++ // ownership of the requested rank, so reject forged higher Monster ranks.
++ if (IsSpiritShrouded() &&
++     (SpiritShroudTransitionPending() || IsDead() ||
++      ability->category != AACategory::ShroudActive ||
++      GetAA(rank_id) < uint32_t(rank->current_value) ||
++      rank->spell_type < 0 || rank->spell_type > pTimerAAEnd - pTimerAAStart)) {
++  return;
++ }
+ 	//if expendable make sure we have charges
+ 	if (ability->charges > 0 && charges < 1)
+ 		return;
+@@ -1573,17 +1660,14 @@
+ 		return false;
+ 	}
+ 
+-	if (!(a->classes & (1 << GetClass()))) {
+-		return false;
+-	}
+-
+-	// Passive and Active Shroud AAs, skip for now
+-	if (
+-		a->category == AACategory::ShroudPassive ||
+-		a->category == AACategory::ShroudActive
+-	) {
+-		return false;
+-	}
++
++ if(a->category==AACategory::ShroudPassive || a->category==AACategory::ShroudActive) {
++  if(!IsClient() || !CastToClient()->IsSpiritShrouded())return false;
++  const auto* form=CastToClient()->SpiritShroudDefinition();
++  return form && SpiritShroud::PreviewRange(*form,rank).valid;
++ }
++ if(IsClient() && CastToClient()->IsSpiritShrouded())return false;
++ if(!(a->classes & (1 << GetClass())))return false;
+ 
+ 	//the one titanium hack i will allow
+ 	//just to make sure we dont crash the client with newer aas
+@@ -2039,6 +2123,8 @@
+ }
+ 
+ void Client::ResetAlternateAdvancementRank(uint32 aa_id) {
++	if (IsSpiritShrouded()) return;
++
+ 
+ 	/*
+ 		Resets your AA to baseline
+@@ -2059,6 +2145,8 @@
+ }
+ 
+ void Client::TogglePurchaseAlternativeAdvancementRank(int rank_id){
++	if (IsSpiritShrouded()) return;
++
+ 
+ 	/*
+ 		Stripped down version of purchasing AA. Will give no messages.
+@@ -2092,6 +2180,8 @@
+ }
+ 
+ void Client::AutoGrantAAPoints() {
++	if (IsSpiritShrouded()) return;
++
+ 	int auto_grant_expansion = RuleI(Expansion, AutoGrantAAExpansion);
+ 
+ 	if (auto_grant_expansion == -1) {
+@@ -2161,6 +2251,8 @@
+ 
+ void Client::GrantAllAAPoints(uint8 unlock_level, bool skip_grant_only)
+ {
++	if (IsSpiritShrouded()) return;
++
+ 	//iterate through every AA
+ 	for (auto& aa : zone->aa_abilities) {
+ 		AA::Ability* ability = aa.second.get();
+--- a/zone/attack.cpp
++++ b/zone/attack.cpp
+@@ -1,3 +1,4 @@
++#include "../common/shroud/native_stats.h"
+ /*	EQEMu: Everquest Server Emulator
+ Copyright (C) 2001-2002 EQEMu Development Team (http://eqemulator.net)
+ 
+@@ -904,7 +905,8 @@
+ //SYNC WITH: tune.cpp, mob.h TuneACSum
+ int Mob::ACSum(bool skip_caps)
+ {
+-	int ac = 0; // this should be base AC whenever shrouds come around
++	int ac = IsClient() && CastToClient()->GetPP().shroud_native_stats_valid ?
++		CastToClient()->GetPP().shroud_native_stats[SpiritShroud::AC] : 0;
+ 	ac += itembonuses.AC; // items + food + tribute
+ 	int shield_ac = 0;
+ 	if (HasShieldEquipped() && IsOfClientBot()) {
+@@ -2048,7 +2050,14 @@
+ 			} else {
+ 				newexp -= exploss;
+ 			}
++			const auto before_loss = GetEXP();
+ 			SetEXP(ExpSource::Death, newexp, GetAAXP());
++			// A corpse may refund only an applied debit. The provisional shroud
++			// XP path currently holds the original profile unchanged; advertising
++			// an unapplied loss would mint normal XP after the shroud is removed.
++			if (IsSpiritShrouded()) {
++				exploss = before_loss > GetEXP() ? before_loss - GetEXP() : 0;
++			}
+ 			//m_epp.perAA = 0;	//reset to no AA exp on death.
+ 		}
+ 
+@@ -3496,6 +3505,12 @@
+ 
+ int Mob::GetHandToHandDamage(void)
+ {
++	if (IsClient()) {
++		const auto& profile = CastToClient()->GetPP();
++		if (profile.shroud_native_stats_valid && profile.shroud_native_stats[SpiritShroud::UnarmedDamage]) {
++			return profile.shroud_native_stats[SpiritShroud::UnarmedDamage];
++		}
++	}
+ 	if (RuleB(Combat, UseRevampHandToHand)) {
+ 		// everyone uses this in the revamp!
+ 		int skill = GetSkill(EQ::skills::SkillHandtoHand);
+@@ -6690,8 +6705,10 @@
+ 		int delay = 3500;
+ 
+ 		//if we have no weapon..
+-		if (ItemToUse == nullptr)
+-			delay = 100 * GetHandToHandDelay();
++		if (ItemToUse == nullptr) {
++			delay = m_pp.shroud_native_stats_valid && m_pp.shroud_native_stats[SpiritShroud::UnarmedDelay] ?
++				m_pp.shroud_native_stats[SpiritShroud::UnarmedDelay] : 100 * GetHandToHandDelay();
++		}
+ 		else
+ 			//we have a weapon, use its delay
+ 			delay = 100 * ItemToUse->Delay;
+--- a/zone/bonuses.cpp
++++ b/zone/bonuses.cpp
+@@ -276,7 +276,7 @@
+ 		return;
+ 	}
+ 
+-	if (IsClient() && !is_tribute && !inst->IsEquipable(GetBaseRace(), GetClass())) {
++	if (IsClient() && !is_tribute && !inst->IsEquipable(GetBaseRace(), GetClass()) && !CastToClient()->IsSpiritShroudStarterItem(inst)) {
+ 		if (item->ItemType != EQ::item::ItemTypeFood && item->ItemType != EQ::item::ItemTypeDrink) {
+ 			return;
+ 		}
+--- a/zone/client.cpp
++++ b/zone/client.cpp
+@@ -1018,6 +1018,7 @@
+ 
+ bool Client::SaveAA()
+ {
++ if(m_spirit_shroud_transition)return false;
+ 	if (m_fellowship_xp_persistence_failed || m_fellowship_xp_transaction_active) return false;
+ 	std::vector<CharacterAlternateAbilitiesRepository::CharacterAlternateAbilities> v;
+ 
+@@ -1048,7 +1049,11 @@
+ 		}
+ 	}
+ 
+-	m_pp.aapoints_spent = aa_points_spent + m_epp.expended_aa;
++	// Free Monster AA grants do not debit this session's purchased-point pool.
++	// Its spent amount is maintained by the transactional allocation ledger.
++	if (!IsSpiritShrouded()) {
++		m_pp.aapoints_spent = aa_points_spent + m_epp.expended_aa;
++	}
+ 
+ 	if (v.empty()) {
+ 		return true;
+@@ -1070,6 +1075,7 @@
+ }
+ 
+ bool Client::Save(uint8 iCommitNow) {
++ if(m_spirit_shroud_transition)return false;
+ 	if (m_mercenary_persistence_failed) return false;
+ 	if (m_fellowship_xp_persistence_failed || m_fellowship_xp_transaction_active) return false;
+ 	if (m_inventory_session_rejected ||
+@@ -1303,6 +1309,7 @@
+ 	strn0cpy(message, orig_message, sizeof(message));
+ 
+ 	LogDebug("Client::ChannelMessageReceived() Channel:[{}] message:[{}]", chan_num, message);
++ if(chan_num==8 && TrySpiritShroudChat(message))return;
+ 
+ 	if (RuleB(Chat, AlwaysCaptureCommandText)) {
+ 		if (message[0] == COMMAND_CHAR) {
+@@ -5980,6 +5987,12 @@
+ 
+ void Client::SummonAndRezzAllCorpses()
+ {
++	// This path also marks corpses resurrected before SetEXP. The ordinary
++	// resurrection-answer guard must apply to summon-all/quest invocations too.
++	if (IsSpiritShrouded()) {
++		Message(Chat::Yellow, "Remove your shroud before resurrecting your corpses.");
++		return;
++	}
+ 	PendingRezzXP = -1;
+ 
+ 	auto Pack = new ServerPacket(ServerOP_DepopAllPlayersCorpses, sizeof(ServerDepopAllPlayersCorpses_Struct));
+--- a/zone/client.h
++++ b/zone/client.h
+@@ -1,4 +1,5 @@
+ #include <chrono>
++#include <optional>
+ /* EQEMu: Everquest Server Emulator
+ 	Copyright (C) 2001-2003 EQEMu Development Team (http://eqemulator.org)
+ 
+@@ -19,6 +20,7 @@
+ #ifndef CLIENT_H
+ #define CLIENT_H
+ 
++namespace SpiritShroud { struct Template; }
+ class Client;
+ class EQApplicationPacket;
+ class DynamicZone;
+@@ -294,6 +296,34 @@
+ 	void RejectInventorySessionAdmission() { m_inventory_session_rejected = true; }
+ 	bool HasInventorySessionReservation() const;
+ 	std::shared_ptr<Housing::InventorySessions::ZoneReservation> InventorySessionReleaseTicket() const;
++
++
++ const SpiritShroud::Template* SpiritShroudDefinition() const { return m_spirit_shroud_definition.get(); }
++ bool LoadSpiritShroudState();
++ bool SpiritShroudTransitionPending() const { return m_spirit_shroud_transition; }
++ bool SaveSpiritShroudCheckpoint();
++ bool HasSpiritShroudRank(uint32_t rank) const;
++ void SendSpiritShroudProgress();
++ bool TrySpiritShroudAbility(uint32_t action,uint32_t ability);
++ bool CompleteSpiritShroudReturn(uint32_t rank_id);
++ bool IsSpiritShroudStarterItem(const EQ::ItemInstance* item) const;
++ void PurchaseSpiritShroudRank(uint32_t rank_id, bool saved_set);
++ float SpiritShroudModelSize() const;
++ std::optional<uint32_t> SpiritShroudAbilityMinimumLevel(uint16_t spell_id, uint32_t rank_id) const;
++ bool IsSpiritShrouded() const { return m_spirit_shroud_template != 0; }
++ bool TrySpiritShroudChat(const char*);
++ void OpenSpiritShrouds();
++ void ChangeSpiritShroud(uint32_t template_id);
++ void OpenSpiritShroudBank();
++ void AwardSpiritShroudExperience(ExpSource source, uint64_t amount, uint8 conlevel = 0xFF,
++   bool already_calculated = false, uint64_t aa_amount = 0);
++ void CalculateSpiritShroudExperience(uint64_t amount, uint8 conlevel, uint32_t percent_to_aa,
++   uint64_t earned_aa, uint64_t& normal, uint64_t& aa, uint64_t& progression);
++ void Handle_OP_SpiritShroudRequest(const EQApplicationPacket*);
++ void Handle_OP_SpiritShroudSelect(const EQApplicationPacket*);
++ void Handle_OP_SpiritShroudCancel(const EQApplicationPacket*);
++ void Handle_OP_SpiritShroudPreview(const EQApplicationPacket*);
++ void Handle_OP_SpiritShroudBank(const EQApplicationPacket*);
+ 
+ 	~Client();
+ 
+@@ -522,11 +552,12 @@
+ 	virtual bool Save() { return Save(0); }
+ 	bool Save(uint8 iCommitNow); // 0 = delayed, 1=async now, 2=sync now
+ 	inline void SaveCharacterData() {
++ if(m_spirit_shroud_transition)return;
+ 		database.SaveCharacterData(this, &m_pp, &m_epp);
+ 	};
+ 
+ 	/* New PP Save Functions */
+-	bool SaveCurrency(){ return !m_mercenary_persistence_failed && !m_inventory_session_rejected && database.SaveCharacterCurrency(this->CharacterID(), &m_pp); }
++	bool SaveCurrency(){ return !m_spirit_shroud_transition && !m_mercenary_persistence_failed && !m_inventory_session_rejected && database.SaveCharacterCurrency(this->CharacterID(), &m_pp); }
+ 	bool SaveAA();
+ 	void RemoveExpendedAA(int aa_id);
+ 
+@@ -801,10 +832,11 @@
+ 	uint64 GetExperienceForKill(Mob *against);
+ 	void AddEXP(ExpSource exp_source, uint64 in_add_exp, uint8 conlevel = 0xFF, bool resexp = false, NPC* npc = nullptr);
+ 	uint64 CalcEXP(uint8 conlevel = 0xFF, bool ignore_mods = false);
+-	void CalculateNormalizedAAExp(uint64 &add_aaxp, uint8 conlevel, bool resexp);
++	void CalculateNormalizedAAExp(uint64 &add_aaxp, uint8 conlevel, bool resexp, int aa_percent = -1);
+ 	void CalculateStandardAAExp(uint64 &add_aaxp, uint8 conlevel, bool resexp);
+ 	void CalculateLeadershipExp(uint64 &add_exp, uint8 conlevel);
+-	void CalculateExp(uint64 in_add_exp, uint64 &add_exp, uint64 &add_aaxp, uint8 conlevel, bool resexp);
++	void CalculateExp(uint64 in_add_exp, uint64 &add_exp, uint64 &add_aaxp, uint8 conlevel, bool resexp,
++		int aa_percent = -1, bool leadership = true);
+ 	void SetEXP(ExpSource exp_source, uint64 set_exp, uint64 set_aaxp, bool resexp = false, NPC* npc = nullptr);
+ 	void AddLevelBasedExp(ExpSource exp_source, uint8 exp_percentage, uint8 max_level = 0, bool ignore_mods = false);
+ 	void SetLeadershipEXP(uint64 group_exp, uint64 raid_exp);
+@@ -1095,7 +1127,7 @@
+ 	inline PTimerList &GetPTimers() { return(p_timers); }
+ 
+ 	//New AA Methods
+-	void SendAlternateAdvancementRank(int aa_id, int level);
++	void SendAlternateAdvancementRank(int aa_id, int level, const SpiritShroud::Template* shroud_preview = nullptr);
+ 	void SendAlternateAdvancementTable();
+ 	void SendAlternateAdvancementStats();
+ 	void PurchaseAlternateAdvancementRank(int rank_id);
+@@ -2125,6 +2157,13 @@
+ 	uint8 playeraction;
+ 
+ 	bool m_inventory_session_rejected = false;
++ bool m_spirit_shroud_transition = false;
++ uint32_t m_spirit_shroud_template = 0, m_spirit_shroud_keeper = 0;
++ uint64_t m_spirit_shroud_menu_until = 0, m_spirit_shroud_progress_sent = 0;
++ std::set<uint32_t> m_spirit_shroud_aa_ranks;
++ uint64_t m_spirit_shroud_session_id = 0, m_spirit_shroud_revision = 0;
++ std::shared_ptr<const SpiritShroud::Template> m_spirit_shroud_definition;
++ uint8_t m_spirit_shroud_resource_refreshes = 0;
+ 	std::shared_ptr<Housing::InventorySessions::ZoneReservation> m_inventory_session_reservation;
+ 	std::unique_ptr<Housing::InventoryBridge::Bridge> m_housing_inventory_bridge;
+ 	std::shared_ptr<Housing::NativePlacement::Session> m_housing_placement_session;
+--- a/zone/client_mods.cpp
++++ b/zone/client_mods.cpp
+@@ -23,6 +23,8 @@
+ #include "../common/spdat.h"
+ 
+ #include "client.h"
++#include "../common/shroud/native_stats.h"
++#include "../common/shroud/resource_baseline.h"
+ #include "mob.h"
+ 
+ #include "bot.h"
+@@ -239,7 +241,7 @@
+ 	int64 base = 0;
+ 	auto base_data = zone->GetBaseData(GetLevel(), GetClass());
+ 	if (base_data.level == GetLevel()) {
+-		base = static_cast<int>(base_data.hp_regen);
++		base = m_pp.shroud_native_stats_valid ? m_pp.shroud_native_stats[SpiritShroud::HPRegen] : static_cast<int>(base_data.hp_regen);
+ 	}
+ 
+ 	auto level = GetLevel();
+@@ -327,6 +329,8 @@
+ 	max_hp = (float)max_hp * (float)nd / (float)10000; //this is to fix the HP-above-495k issue
+ 	max_hp += spellbonuses.FlatMaxHPChange + aabonuses.FlatMaxHPChange + itembonuses.FlatMaxHPChange;
+ 
++	// RoF2 applies the player +5 after alternate-profile percentage/flat modifiers.
++	if (m_pp.shroud_native_resources_valid) max_hp += 5;
+ 	max_hp += GroupLeadershipAAHealthEnhancement();
+ 	if (current_hp > max_hp) {
+ 		current_hp = max_hp;
+@@ -481,7 +485,7 @@
+ 
+ int64 Client::CalcBaseHP()
+ {
+-	if (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd)) {
++	if (m_pp.shroud_native_resources_valid || (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd))) {
+ 		int stats = GetSTA();
+ 		if (stats > 255) {
+ 			stats = (stats - 255) / 2;
+@@ -490,7 +494,13 @@
+ 		base_hp = 5;
+ 		auto base_data = zone->GetBaseData(GetLevel(), GetClass());
+ 		if (base_data.level == GetLevel()) {
+-			base_hp += base_data.hp + (base_data.hp_fac * stats);
++			// The matching RoF2 client replaces BaseData.hp with the alternate
++			// contribution, while retaining its class/level stamina factor.
++			if (m_pp.shroud_native_resources_valid) {
++				base_hp = m_pp.shroud_native_stats[SpiritShroud::HP] + SpiritShroud::HPStaminaContribution(stats, base_data.hp_fac);
++			} else {
++				base_hp += base_data.hp + (base_data.hp_fac * stats);
++			}
+ 			base_hp += itembonuses.heroic_max_hp;
+ 		}
+ 	}
+@@ -568,7 +578,7 @@
+ 	if (IsIntelligenceCasterClass()) {
+ 		WisInt = GetINT();
+ 
+-		if (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd)) {
++		if (m_pp.shroud_native_resources_valid || (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd))) {
+ 			ConvertedWisInt = WisInt;
+ 
+ 			int over200 = WisInt;
+@@ -581,7 +591,7 @@
+ 
+ 			auto base_data = zone->GetBaseData(GetLevel(), GetClass());
+ 			if (base_data.level == GetLevel()) {
+-				max_m = base_data.mana + (ConvertedWisInt * base_data.mana_fac) + itembonuses.heroic_max_mana;
++				max_m = (m_pp.shroud_native_resources_valid ? m_pp.shroud_native_stats[SpiritShroud::Mana] : base_data.mana) + (ConvertedWisInt * base_data.mana_fac) + itembonuses.heroic_max_mana;
+ 			}
+ 		} else {
+ 			if (((WisInt - 199) / 2) > 0) {
+@@ -601,7 +611,7 @@
+ 	} else if (IsWisdomCasterClass()) {
+ 		WisInt = GetWIS();
+ 
+-		if (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd)) {
++		if (m_pp.shroud_native_resources_valid || (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd))) {
+ 			ConvertedWisInt = WisInt;
+ 
+ 			int over200 = WisInt;
+@@ -614,7 +624,7 @@
+ 
+ 			auto base_data = zone->GetBaseData(GetLevel(), GetClass());
+ 			if (base_data.level == GetLevel()) {
+-				max_m = base_data.mana + (ConvertedWisInt * base_data.mana_fac) + itembonuses.heroic_max_mana;
++				max_m = (m_pp.shroud_native_resources_valid ? m_pp.shroud_native_stats[SpiritShroud::Mana] : base_data.mana) + (ConvertedWisInt * base_data.mana_fac) + itembonuses.heroic_max_mana;
+ 			}
+ 		} else {
+ 			if (((WisInt - 199) / 2) > 0) {
+@@ -665,7 +675,10 @@
+ 	// will get at least 1 for standing and 2 for sitting.
+ 	bool old = RuleB(Character, OldMinMana);
+ 	if (!IsStarved()) {
+-		// client does some base regen for shrouds here
++		// Alternate profile base regeneration precedes meditation bonuses.
++		if (m_pp.shroud_native_stats_valid) {
++			regen = m_pp.shroud_native_stats[(IsSitting() || CanMedOnHorse()) ? SpiritShroud::ManaRegenSitting : SpiritShroud::ManaRegenStanding];
++		}
+ 		if (IsSitting() || CanMedOnHorse()) {
+ 			// kind of weird to do it here w/e
+ 			// client does some base medding regen for shrouds here
+@@ -1068,6 +1081,9 @@
+ 		default:
+ 			MR = 20;
+ 	}
++	if (m_pp.shroud_native_stats_valid) {
++		MR = m_pp.shroud_native_stats[SpiritShroud::Magic];
++	}
+ 	MR += itembonuses.MR + spellbonuses.MR + aabonuses.MR;
+ 	if (GetClass() == Class::Warrior || GetClass() == Class::Berserker) {
+ 		MR += GetLevel() / 2;
+@@ -1142,6 +1158,9 @@
+ 		default:
+ 			FR = 20;
+ 	}
++	if (m_pp.shroud_native_stats_valid) {
++		FR = m_pp.shroud_native_stats[SpiritShroud::Fire];
++	}
+ 	int c = GetClass();
+ 	if (c == Class::Ranger) {
+ 		FR += 4;
+@@ -1228,6 +1247,9 @@
+ 		default:
+ 			DR = 15;
+ 	}
++	if (m_pp.shroud_native_stats_valid) {
++		DR = m_pp.shroud_native_stats[SpiritShroud::Disease];
++	}
+ 	int c = GetClass();
+ 	// the monk one is part of base resist
+ 	if (c == Class::Monk) {
+@@ -1320,6 +1342,9 @@
+ 		default:
+ 			PR = 15;
+ 	}
++	if (m_pp.shroud_native_stats_valid) {
++		PR = m_pp.shroud_native_stats[SpiritShroud::Poison];
++	}
+ 	int c = GetClass();
+ 	// this monk bonus is part of the base
+ 	if (c == Class::Monk) {
+@@ -1412,6 +1437,9 @@
+ 		default:
+ 			CR = 25;
+ 	}
++	if (m_pp.shroud_native_stats_valid) {
++		CR = m_pp.shroud_native_stats[SpiritShroud::Cold];
++	}
+ 	int c = GetClass();
+ 	if (c == Class::Ranger || c == Class::Beastlord) {
+ 		CR += 4;
+@@ -1432,7 +1460,7 @@
+ 
+ int32	Client::CalcCorrup()
+ {
+-	Corrup = GetBaseCorrup() + itembonuses.Corrup + spellbonuses.Corrup + aabonuses.Corrup;
++	Corrup = (m_pp.shroud_native_stats_valid ? m_pp.shroud_native_stats[SpiritShroud::Corruption] : GetBaseCorrup()) + itembonuses.Corrup + spellbonuses.Corrup + aabonuses.Corrup;
+ 	if (Corrup > GetMaxCorrup()) {
+ 		Corrup = GetMaxCorrup();
+ 	}
+@@ -1441,7 +1469,7 @@
+ 
+ int32 Client::CalcATK()
+ {
+-	ATK = itembonuses.ATK + spellbonuses.ATK + aabonuses.ATK + GroupLeadershipAAOffenseEnhancement();
++	ATK = (m_pp.shroud_native_stats_valid ? m_pp.shroud_native_stats[SpiritShroud::Attack] : 0) + itembonuses.ATK + spellbonuses.ATK + aabonuses.ATK + GroupLeadershipAAOffenseEnhancement();
+ 	return (ATK);
+ }
+ 
+@@ -1622,18 +1650,23 @@
+ int64 Client::CalcBaseEndurance()
+ {
+ 	int64 base_end = 0;
+-	if (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd)) {
+-		double stats = (GetSTR() + GetSTA() + GetDEX() + GetAGI()) / 4.0f;
+-
+-		if (stats > 201.0f) {
+-			stats = 1.25f * (stats - 201.0f) + 352.5f;
+-		}
+-		else if (stats > 100.0f) {
+-			stats = 2.5f * (stats - 100.0f) + 100.0f;
++	if (m_pp.shroud_native_resources_valid || (ClientVersion() >= EQ::versions::ClientVersion::SoF && RuleB(Character, SoDClientUseSoDHPManaEnd))) {
++		double stats;
++		if (m_pp.shroud_native_resources_valid) {
++			stats = SpiritShroud::EndurancePhysicalStat(GetSTR(), GetSTA(), GetDEX(), GetAGI());
++		}
++		else {
++			stats = (GetSTR() + GetSTA() + GetDEX() + GetAGI()) / 4.0f;
++			if (stats > 201.0f) {
++				stats = 1.25f * (stats - 201.0f) + 352.5f;
++			}
++			else if (stats > 100.0f) {
++				stats = 2.5f * (stats - 100.0f) + 100.0f;
++			}
+ 		}
+ 		auto base_data = zone->GetBaseData(GetLevel(), GetClass());
+ 		if (base_data.level == GetLevel()) {
+-			base_end = base_data.end + itembonuses.heroic_max_end + (base_data.end_fac * static_cast<int>(stats));
++			base_end = (m_pp.shroud_native_resources_valid ? m_pp.shroud_native_stats[SpiritShroud::Endurance] : base_data.end) + itembonuses.heroic_max_end + (base_data.end_fac * static_cast<int>(stats));
+ 		}
+ 	}
+ 	else {
+@@ -1670,7 +1703,7 @@
+ 	if (!IsStarved()) {
+ 		auto base_data = zone->GetBaseData(GetLevel(), GetClass());
+ 		if (base_data.level == GetLevel()) {
+-			base = static_cast<int>(base_data.end_regen);
++			base = m_pp.shroud_native_stats_valid ? m_pp.shroud_native_stats[SpiritShroud::EnduranceRegen] : static_cast<int>(base_data.end_regen);
+ 			if (!auto_attack && base > 0)
+ 				base += base / 2;
+ 		}
+--- a/zone/client_packet.cpp
++++ b/zone/client_packet.cpp
+@@ -102,6 +102,12 @@
+ 	ConnectingOpcodes.clear();
+ 	memset(ConnectedOpcodes, 0, sizeof(ConnectedOpcodes));
+ 
++ ConnectedOpcodes[OP_SpiritShroudRequest]=&Client::Handle_OP_SpiritShroudRequest;
++ ConnectedOpcodes[OP_SpiritShroudSelect]=&Client::Handle_OP_SpiritShroudSelect;
++ ConnectedOpcodes[OP_SpiritShroudCancel]=&Client::Handle_OP_SpiritShroudCancel;
++ ConnectedOpcodes[OP_SpiritShroudAbilityRequest]=&Client::Handle_OP_SpiritShroudPreview;
++ ConnectedOpcodes[OP_SpiritShroudEquipmentRequest]=&Client::Handle_OP_SpiritShroudPreview;
++ ConnectedOpcodes[OP_SpiritShroudBank]=&Client::Handle_OP_SpiritShroudBank;
+ 	// Now put all the opcodes into their home...
+ 	// connecting opcode handler assignments:
+ 	ConnectingOpcodes[OP_ApproveZone] = &Client::Handle_Connect_OP_ApproveZone;
+@@ -513,7 +519,34 @@
+ 		(EQEmuLogSys::Instance()->IsLogEnabled(Logs::Detail, Logs::PacketClientServer) ? DumpPacketToString(app) : "")
+ 	);
+ 
+-	EmuOpcode opcode = app->GetOpcode();
++ EmuOpcode opcode = app->GetOpcode();
++ // A committed profile exchange leaves this old Client read-only until the
++ // same-zone transfer deletes it; only that transfer handshake may proceed.
++ if(m_spirit_shroud_transition && opcode!=OP_ZoneChange && opcode!=OP_AckPacket && opcode!=OP_DeleteSpawn) return true;
++ if(IsSpiritShrouded() && (opcode==OP_BankerChange || opcode==OP_Trader || opcode==OP_BazaarSearch || opcode==OP_AltCurrencyMerchantRequest)) return true;
++ if(IsSpiritShrouded() && opcode==OP_MoveCoin)return true;
++ // Temporary equipment must remain in this profile until restoration. Broader
++ // trading and crafting support will require explicit transfer provenance.
++ if(IsSpiritShrouded() && (opcode==OP_TradeRequest || opcode==OP_TradeRequestAck ||
++    opcode==OP_TradeAcceptClick || opcode==OP_ShopPlayerSell || opcode==OP_GroundSpawn ||
++    opcode==OP_GuildBank || opcode==OP_TradeSkillCombine || opcode==OP_RecipeAutoCombine ||
++    opcode==OP_AugmentItem || opcode==OP_TributeItem || opcode==OP_GuildTributeDonateItem ||
++    opcode==OP_ShopSendParcel || opcode==OP_AltCurrencySell || opcode==OP_AltCurrencyReclaim))return true;
++ if(IsSpiritShrouded() && std::string(OpcodeManager::EmuToName(opcode)).rfind("OP_Mercenary",0)==0)return true;
++ if(IsSpiritShrouded() && (opcode==OP_MoveItem || opcode==OP_DeleteItem || opcode==OP_DeleteCharge) && app->size==sizeof(MoveItem_Struct)) {
++  auto* move=reinterpret_cast<const MoveItem_Struct*>(app->pBuffer);
++  const auto held_bank=[](uint32_t slot){return
++   (slot>=EQ::invslot::BANK_BEGIN && slot<=EQ::invslot::BANK_END) ||
++   (slot>=EQ::invslot::SHARED_BANK_BEGIN && slot<=EQ::invslot::SHARED_BANK_END) ||
++   (slot>=EQ::invbag::BANK_BAGS_BEGIN && slot<=EQ::invbag::SHARED_BANK_BAGS_END);};
++  if(held_bank(move->from_slot)||held_bank(move->to_slot))return true;
++  const auto external=[](uint32_t slot){return
++   (slot>=EQ::invslot::TRADE_BEGIN && slot<=EQ::invslot::TRADE_END) ||
++   (slot>=EQ::invslot::WORLD_BEGIN && slot<=EQ::invslot::WORLD_END);};
++  if(external(move->from_slot)||external(move->to_slot))return true;
++ }
++
++
+ 	if (opcode == OP_AckPacket) {
+ 		return true;
+ 	}
+@@ -587,6 +620,14 @@
+ 	SetDueling(false);
+ 
+ 	EnteringMessages(this);
++ // RoF2's alternate profile path does not request the normal AA definition
++ // table. Rebuild it on every shrouded zone entry, including a fresh login.
++ if(IsSpiritShrouded()) {
++  SendAlternateAdvancementTable();
++  SendAlternateAdvancementPoints();
++  SendAlternateAdvancementTimers();
++ }
++ SendSpiritShroudProgress();
+ 	LoadPEQZoneFlags();
+ 	LoadZoneFlags();
+ 	LoadAccountFlags();
+@@ -1131,7 +1172,14 @@
+ 	if (!Spawned())
+ 		SendZoneInPackets();
+ 	CompleteConnect();
+-	SendHPUpdate();
++	// RoF2 can clamp the alternate profile during initialization after sending
++	// ClientReady. Republish on a bounded number of ordinary HP timer ticks.
++	m_spirit_shroud_resource_refreshes = IsSpiritShrouded() ? 3 : 0;
++	SendHPUpdate(IsSpiritShrouded());
++	if (IsSpiritShrouded()) {
++		SendManaUpdate();
++		SendEnduranceUpdate();
++	}
+ }
+ 
+ void Client::Handle_Connect_OP_ClientUpdate(const EQApplicationPacket *app)
+@@ -1476,6 +1524,7 @@
+ 	database.LoadCharacterPotionBelt(cid, &m_pp); /* Load Character Potion Belt */
+ 	database.LoadCharacterCurrency(cid, &m_pp); /* Load Character Currency into PP */
+ 	database.LoadCharacterData(cid, &m_pp, &m_epp); /* Load Character Data from DB into PP as well as E_PP */
++ if(!LoadSpiritShroudState())return;
+ 	database.LoadCharacterSkills(cid, &m_pp); /* Load Character Skills */
+ 	database.LoadCharacterInspectMessage(cid, &m_inspect_message); /* Load Character Inspect Message */
+ 	database.LoadCharacterSpellBook(cid, &m_pp); /* Load Character Spell Book */
+@@ -1638,6 +1687,9 @@
+ 		size = 0;
+ 	}
+ 
++ // Preserve the captured shroud model scale instead of the player-race default.
++ if(IsSpiritShrouded() && SpiritShroudModelSize()>0)base_size=size=SpiritShroudModelSize();
++
+ 	/* Check for Invalid points */
+ 	if (m_pp.ldon_points_guk < 0 || m_pp.ldon_points_guk > 2000000000) { m_pp.ldon_points_guk = 0; }
+ 	if (m_pp.ldon_points_mir < 0 || m_pp.ldon_points_mir > 2000000000) { m_pp.ldon_points_mir = 0; }
+@@ -1828,6 +1880,23 @@
+ 	/* The entityid field in the Player Profile is used by the Client in relation to Group Leadership AA */
+ 	m_pp.entityid = GetID();
+ 	memcpy(outapp->pBuffer, &m_pp, outapp->size);
++	if (IsSpiritShrouded()) {
++		// Native alternate profiles use the same ownership triples as RespondAA:
++		// highest owned rank ID, cumulative cost, charges. Persisted AA counts
++		// and the server's profile remain in their ordinary storage format.
++		auto* profile = reinterpret_cast<PlayerProfile_Struct*>(outapp->pBuffer);
++		for (auto& owned : profile->aa_array) {
++			if (!owned.AA) continue;
++			auto* ability = zone->GetAlternateAdvancementAbilityByRank(owned.AA);
++			auto* rank = ability ? ability->GetRankByPointsSpent(owned.value) : nullptr;
++			if (rank) {
++				owned.AA = rank->id;
++				owned.value = rank->total_cost;
++			} else {
++				owned = {};
++			}
++		}
++	}
+ 	outapp->priority = 6;
+ 	FastQueuePacket(&outapp);
+ 
+@@ -2015,6 +2084,7 @@
+ 		return;
+ 	}
+ 	AA_Action* action = (AA_Action*)app->pBuffer;
++ if(TrySpiritShroudAbility(action->action,action->ability))return;
+ 
+ 	if (action->action == aaActionActivate) {//AA Hotkey
+ 		LogAA("Activating AA [{}]", action->ability);
+@@ -13920,6 +13990,13 @@
+ void Client::Handle_OP_RezzAnswer(const EQApplicationPacket *app)
+ {
+ 	VERIFY_PACKET_LENGTH(OP_RezzAnswer, app, Resurrect_Struct);
++ // Until corpse-domain settlement is verified, preserve the offer rather than
++ // marking a normal corpse resurrected while temporary-profile SetEXP drops it.
++ if(IsSpiritShrouded()){
++  Message(Chat::Yellow,"Remove your shroud before accepting this resurrection.");
++  return;
++ }
++
+ 
+ 	const auto* r = (const Resurrect_Struct*) app->pBuffer;
+ 
+--- a/zone/client_process.cpp
++++ b/zone/client_process.cpp
+@@ -117,7 +117,13 @@
+ 		// SendHPUpdate calls hpupdate_timer.Start so it can delay this timer, so lets not reset with the check
+ 		// since the function will anyways
+ 		if (hpupdate_timer.Check(false)) {
+-			SendHPUpdate();
++			const bool refresh_shroud_resources = IsSpiritShrouded() && m_spirit_shroud_resource_refreshes;
++			SendHPUpdate(refresh_shroud_resources);
++			if (refresh_shroud_resources) {
++				--m_spirit_shroud_resource_refreshes;
++				SendManaUpdate();
++				SendEnduranceUpdate();
++			}
+ 		}
+ 
+ 		/* I haven't naturally updated my position in 10 seconds, updating manually */
+@@ -1055,6 +1061,8 @@
+ 
+ void Client::OPRezzAnswer(uint32 Action, uint32 SpellID, uint16 ZoneID, uint16 InstanceID, float x, float y, float z)
+ {
++ if(IsSpiritShrouded())return; // Do not consume a cross-profile resurrection claim.
++
+ 	if(PendingRezzXP < 0) {
+ 		// pendingrezexp is set to -1 if we are not expecting an OP_RezzAnswer
+ 		LogSpells("Unexpected OP_RezzAnswer. Ignoring it");
+--- a/zone/corpse.cpp
++++ b/zone/corpse.cpp
+@@ -268,7 +268,11 @@
+ 	m_consented_guild_id = c->AutoConsentGuildEnabled() ? c->GuildID() : 0;
+ 
+ 	m_is_corpse_changed         = true;
+-	m_rezzed_experience         = rez_exp;
++	// Temporary forms retain their possessions on death until session-aware
++	// corpse custody is implemented. A corpse must not later return starter
++	// equipment into the restored original profile or strand earned bag children.
++	const bool keep_shroud_possessions = c->IsSpiritShrouded();
++	m_rezzed_experience         = keep_shroud_possessions ? 0 : rez_exp;
+ 	m_is_player_corpse          = true;
+ 	m_is_locked                 = false;
+ 	m_being_looted_by_entity_id = 0xFFFFFFFF;
+@@ -307,6 +311,7 @@
+ 
+ 	/* Check Rule to see if we can leave corpses */
+ 	if (
++		!keep_shroud_possessions &&
+ 		(!RuleB(Character, LeaveNakedCorpses) || RuleB(Character, LeaveCorpses)) &&
+ 		GetLevel() >= RuleI(Character, DeathItemLossLevel)
+ 		) {
+--- a/zone/exp.cpp
++++ b/zone/exp.cpp
+@@ -245,7 +245,7 @@
+ 	}
+ }
+ 
+-void Client::CalculateNormalizedAAExp(uint64 &add_aaxp, uint8 conlevel, bool resexp)
++void Client::CalculateNormalizedAAExp(uint64 &add_aaxp, uint8 conlevel, bool resexp, int aa_percent)
+ {
+ 	// Functionally this is the same as having the case in the switch, but this is
+ 	// cleaner to read.
+@@ -263,7 +263,7 @@
+ 	uint32 xpPerAA = RuleI(AA, ExpPerPoint);
+ 
+ 	float colorModifier = GetConLevelModifierPercent(conlevel);
+-	float percentToAAXp = (float)m_epp.perAA / 100;
++	float percentToAAXp = (float)(aa_percent<0 ? m_epp.perAA : aa_percent) / 100;
+ 
+ 	// Normalize the amount of AA XP we earned for this kill.
+ 	add_aaxp = percentToAAXp * (xpPerAA / (whiteConKillsPerAA / colorModifier));
+@@ -404,7 +404,8 @@
+ 	}
+ }
+ 
+-void Client::CalculateExp(uint64 in_add_exp, uint64 &add_exp, uint64 &add_aaxp, uint8 conlevel, bool resexp)
++void Client::CalculateExp(uint64 in_add_exp, uint64 &add_exp, uint64 &add_aaxp, uint8 conlevel, bool resexp,
++ int aa_percent, bool leadership)
+ {
+ 	add_exp = in_add_exp;
+ 
+@@ -419,7 +420,7 @@
+ 	if (!resexp)
+ 	{
+ 		//figure out how much of this goes to AAs
+-		add_aaxp = add_exp * m_epp.perAA / 100;
++		add_aaxp = add_exp * (aa_percent<0 ? m_epp.perAA : aa_percent) / 100;
+ 
+ 		//take that amount away from regular exp
+ 		add_exp -= add_aaxp;
+@@ -466,7 +467,7 @@
+ 		}
+ 
+ 		// Calculate any changes to leadership experience.
+-		CalculateLeadershipExp(add_exp, conlevel);
++		if (leadership) CalculateLeadershipExp(add_exp, conlevel);
+ 	}	//end !resexp
+ 
+ 	if (RuleB(Zone, LevelBasedEXPMods)) {
+@@ -497,10 +498,33 @@
+ 	add_exp = GetEXP() + add_exp;
+ }
+ 
++void Client::CalculateSpiritShroudExperience(uint64_t amount, uint8 conlevel, uint32_t percent_to_aa,
++ uint64_t earned_aa, uint64_t& normal, uint64_t& aa, uint64_t& progression)
++{
++ // Encounter eligibility/group splitting has already occurred before AddEXP.
++ // Use the active form for con/rate/zone modifiers, and the escrowed original
++ // allocation for its pending reward. Leadership diversion is deliberately
++ // excluded: its balances are not a temporary-form progression system.
++ uint64 full=0,unused=0,adjusted=0,aa_award=0;
++ CalculateExp(amount,full,unused,conlevel,false,0,false);
++ CalculateExp(amount,adjusted,aa_award,conlevel,false,std::min<uint32_t>(100,percent_to_aa),false);
++ progression=full>GetEXP()?full-GetEXP():0;
++ normal=adjusted>GetEXP()?adjusted-GetEXP():0;
++ if (RuleB(AA,NormalizedAAEnabled))
++  CalculateNormalizedAAExp(aa_award,conlevel,false,std::min<uint32_t>(100,percent_to_aa));
++ else CalculateStandardAAExp(aa_award,conlevel,false);
++ if (RuleB(AA,ModernAAScalingEnabled) && aa_award)
++  aa_award=ScaleAAXPBasedOnCurrentAATotal(static_cast<int>(std::min<uint64_t>(INT32_MAX,earned_aa)),aa_award);
++ if (RuleI(AA,MaxAAEXPPerKill)>=0)
++  aa_award=std::min<uint64>(aa_award,RuleI(AA,MaxAAEXPPerKill));
++ aa=aa_award;
++}
++
+ void Client::AddEXP(ExpSource exp_source, uint64 in_add_exp, uint8 conlevel, bool resexp, NPC* npc) {
+ 	if (!IsEXPEnabled()) {
+ 		return;
+ 	}
++ if(IsSpiritShrouded()){if(!resexp)AwardSpiritShroudExperience(exp_source,in_add_exp,conlevel);return;}
+ 
+ 	uint64 exp = 0;
+ 	uint64 aaexp = 0;
+@@ -575,6 +599,12 @@
+ }
+ 
+ void Client::SetEXP(ExpSource exp_source, uint64 set_exp, uint64 set_aaxp, bool isrezzexp, NPC* npc) {
++ if(IsSpiritShrouded()){
++  if(!isrezzexp && IsEXPEnabled() && (set_exp>m_pp.exp || set_aaxp>m_pp.expAA))
++   AwardSpiritShroudExperience(exp_source,set_exp>m_pp.exp?set_exp-m_pp.exp:0,0xFF,true,
++    set_aaxp>m_pp.expAA?set_aaxp-m_pp.expAA:0);
++  return;
++ }
+ 	uint64 current_exp = GetEXP();
+ 	uint64 current_aa_exp = GetAAXP();
+ 	uint64 total_current_exp = current_exp + current_aa_exp;
+--- a/zone/inventory.cpp
++++ b/zone/inventory.cpp
+@@ -676,6 +676,8 @@
+ // Drop item from inventory to ground (generally only dropped from SLOT_CURSOR)
+ void Client::DropItem(int16 slot_id, bool recurse)
+ {
++ if(IsSpiritShrouded())return; // retain temporary profile custody
++
+ 	LogInventory(
+ 		"[{}] (char_id: [{}]) Attempting to drop item from slot [{}] on the ground",
+ 		GetCleanName(),
+@@ -2106,7 +2108,13 @@
+ 		}
+ 
+ 		EQ::InventoryProfile::SwapItemFailState fail_state = EQ::InventoryProfile::swapInvalid;
+-		if (!m_inv.SwapItem(src_slot_id, dst_slot_id, fail_state, GetBaseRace(), GetBaseClass(), GetDeity(), GetLevel())) {
++  // The shroud-specific staff has the monster race bit, which the ordinary
++  // player-race helper cannot represent. Only an issued, session-marked item
++  // entering equipment may bypass that race check; slot/level/deity still apply.
++  const bool starter_equip=IsSpiritShroudStarterItem(src_inst) &&
++   dst_slot_id>=EQ::invslot::EQUIPMENT_BEGIN && dst_slot_id<=EQ::invslot::EQUIPMENT_END &&
++   !(src_slot_id>=EQ::invslot::EQUIPMENT_BEGIN && src_slot_id<=EQ::invslot::EQUIPMENT_END && dst_inst);
++		if (!m_inv.SwapItem(src_slot_id, dst_slot_id, fail_state, starter_equip?0:GetBaseRace(), GetBaseClass(), GetDeity(), GetLevel())) {
+ 			const char* fail_message = "The selected slot was invalid.";
+ 			if (fail_state == EQ::InventoryProfile::swapRaceClass || fail_state == EQ::InventoryProfile::swapDeity)
+ 				fail_message = "Your class, deity and/or race may not equip that item.";
+--- a/zone/mob.h
++++ b/zone/mob.h
+@@ -406,9 +406,9 @@
+ 		CastAction_type &CastAction, EQ::spells::CastingSlot slot, bool isproc = false);
+ 	bool DoCastingChecksOnCaster(int32 spell_id, EQ::spells::CastingSlot slot);
+ 	bool DoCastingChecksZoneRestrictions(bool check_on_casting, int32 spell_id);
+-	bool DoCastingChecksOnTarget(bool check_on_casting, int32 spell_id, Mob* spell_target);
++	bool DoCastingChecksOnTarget(bool check_on_casting, int32 spell_id, Mob* spell_target, uint32 aa_context = 0);
+ 	virtual bool CheckFizzle(uint16 spell_id);
+-	virtual bool CheckSpellLevelRestriction(Mob *caster, uint16 spell_id);
++	virtual bool CheckSpellLevelRestriction(Mob *caster, uint16 spell_id, uint32 aa_context = 0);
+ 	virtual bool IsImmuneToSpell(uint16 spell_id, Mob *caster);
+ 
+ 	virtual float GetAOERange(uint16 spell_id);
+--- a/zone/pets.cpp
++++ b/zone/pets.cpp
+@@ -660,11 +660,11 @@
+ 	return true;
+ }
+ 
+-bool Pet::CheckSpellLevelRestriction(Mob *caster, uint16 spell_id)
++bool Pet::CheckSpellLevelRestriction(Mob *caster, uint16 spell_id, uint32 aa_context)
+ {
+ 	auto owner = GetOwner();
+ 	if (owner)
+-		return owner->CheckSpellLevelRestriction(caster, spell_id);
++		return owner->CheckSpellLevelRestriction(caster, spell_id, aa_context);
+ 	return true;
+ }
+ 
+--- a/zone/pets.h
++++ b/zone/pets.h
+@@ -7,7 +7,7 @@
+ class Pet : public NPC {
+ 	public:
+ 		Pet(NPCType *type_data, Mob *owner, uint8 pet_type, uint16 spell_id, int16 power);
+-		virtual bool CheckSpellLevelRestriction(Mob *caster, uint16 spell_id);
++		virtual bool CheckSpellLevelRestriction(Mob *caster, uint16 spell_id, uint32 aa_context = 0);
+ 
+ 	};
+ 
+--- a/zone/spell_effects.cpp
++++ b/zone/spell_effects.cpp
+@@ -66,6 +66,13 @@
+ 		if (caster != this) return false;
+ 		return CastToClient()->TryFellowshipCalling();
+ 	}
++
++ // The shroud return AA uses the real cast lifecycle, but its destination is
++ // the keeper stored at transformation rather than the character's bind point.
++ if (spell_id == 7790 && IsClient() && CastToClient()->IsSpiritShrouded()) {
++  if (caster != this || casting_spell_slot != EQ::spells::CastingSlot::AltAbility) return false;
++  return CastToClient()->CompleteSpiritShroudReturn(casting_spell_aa_id);
++ }
+ 
+ 	const SPDat_Spell_Struct &spell = spells[spell_id];
+ 
+--- a/zone/spells.cpp
++++ b/zone/spells.cpp
+@@ -1,3 +1,4 @@
++#include "../common/shroud/ability_cast.h"
+ /*	EQEMu: Everquest Server Emulator
+ Copyright (C) 2001-2002 EQEMu Development Team (http://eqemu.org)
+ 
+@@ -193,7 +194,7 @@
+ 				if ((IsBeneficialSpell(spell_id) && (!(spell_target->IsOfClientBot() || (spell_target->HasOwner() && spell_target->GetOwner()->IsOfClientBot()))))
+ 					|| (IsDetrimentalSpell(spell_id) && (spell_target->IsOfClientBot() || (spell_target->HasOwner() && spell_target->GetOwner()->IsOfClientBot())))) {
+ 					//Check if the target's target is a valid target; we can use DoCastingChecksOnTarget() here because we can let it handle the failure as vanilla would
+-					if (DoCastingChecksOnTarget(true, spell_id, targets_target)) {
++					if (DoCastingChecksOnTarget(true, spell_id, targets_target, slot == CastingSlot::AltAbility ? aa_id : 0)) {
+ 						target_id = targets_target->GetID();
+ 					}
+ 					else {
+@@ -208,7 +209,7 @@
+ 
+ 	if (!DoCastingChecksOnCaster(spell_id, slot) ||
+ 		!DoCastingChecksZoneRestrictions(true, spell_id) ||
+-		!DoCastingChecksOnTarget(true, spell_id, entity_list.GetMobID(target_id))) {
++		!DoCastingChecksOnTarget(true, spell_id, entity_list.GetMobID(target_id), slot == CastingSlot::AltAbility ? aa_id : 0)) {
+ 		StopCastSpell(spell_id, send_spellbar_enable);
+ 		return false;
+ 	}
+@@ -751,7 +752,7 @@
+ }
+ 
+ 
+-bool Mob::DoCastingChecksOnTarget(bool check_on_casting, int32 spell_id, Mob *spell_target) {
++bool Mob::DoCastingChecksOnTarget(bool check_on_casting, int32 spell_id, Mob *spell_target, uint32 aa_context) {
+ 
+ 	/*
+ 		These are casting requirements or TARGETS that will cancel a spell before spell finishes casting or prevent spell from casting.
+@@ -832,7 +833,7 @@
+ 		Prevent buffs from being cast on targets who don't meet level restriction
+ 	*/
+ 
+-	if (!spell_target->CheckSpellLevelRestriction(this, spell_id)) {
++	if (!spell_target->CheckSpellLevelRestriction(this, spell_id, aa_context)) {
+ 		return false;
+ 	}
+ 	/*
+@@ -2468,7 +2469,8 @@
+ 			LogSpells("Spell [{}]: Zone restriction failure.", spell_id);
+ 			return false;
+ 		}
+-		if (!DoCastingChecksOnTarget(true, spell_id, spell_target)) {
++		if (!DoCastingChecksOnTarget(true, spell_id, spell_target,
++   slot == CastingSlot::AltAbility && !isproc ? aa_id : 0)) {
+ 			LogSpells("Spell [{}]: Casting checks on Target failure.", spell_id);
+ 			return false;
+ 		}
+@@ -3436,7 +3438,7 @@
+ // spells 1-50: no restrictons
+ // 51-65: SpellLevel/2+15
+ // 66+ Group Spells 62, Single Target 61
+-bool Mob::CheckSpellLevelRestriction(Mob *caster, uint16 spell_id)
++bool Mob::CheckSpellLevelRestriction(Mob *caster, uint16 spell_id, uint32 aa_context)
+ {
+ 	if (spells[spell_id].target_type == ST_Self) {
+ 		LogSpells("[CheckSpellLevelRestriction] Self Only spell - no restrictions");
+@@ -3476,6 +3478,11 @@
+ 
+ 	if (check_for_restrictions) {
+ 		int spell_level = GetSpellMinimumLevel(spell_id);
++  // Only unlearnable Monster spell placeholders use the authenticated AA minimum.
++  if(spell_level == 255 && aa_context && caster->IsClient()) {
++   if(auto minimum=caster->CastToClient()->SpiritShroudAbilityMinimumLevel(spell_id,aa_context))
++    spell_level=int(SpiritShroud::BuffMinimumLevel(uint32_t(spell_level),minimum));
++  }
+ 
+ 		// Only check for beneficial buffs
+ 		if (IsBuffSpell(spell_id) && IsBeneficialSpell(spell_id)) {
+@@ -4048,7 +4055,9 @@
+ 		0, &args
+ 	);
+ 
+-	if (!DoCastingChecksOnTarget(false, spell_id, spelltar)) {
++	const uint32 aa_context = !isproc && casting_spell_slot == CastingSlot::AltAbility &&
++  casting_spell_id == spell_id ? casting_spell_aa_id : 0;
++ if (!DoCastingChecksOnTarget(false, spell_id, spelltar, aa_context)) {
+ 		safe_delete(action_packet);
+ 		return false;
+ 	}
+@@ -4599,7 +4608,7 @@
+ 	}
+ 
+ 	// make sure spelltar is high enough level for the buff
+-	if (!spelltar->CheckSpellLevelRestriction(this, spell_id)) {
++	if (!spelltar->CheckSpellLevelRestriction(this, spell_id, aa_context)) {
+ 		safe_delete(action_packet);
+ 		return false;
+ 	}
+--- a/zone/zonedb.cpp
++++ b/zone/zonedb.cpp
+@@ -1060,6 +1060,7 @@
+ 	}
+ 
+ 	if (c->m_fellowship_xp_persistence_failed || c->m_fellowship_xp_transaction_active) return false;
++	if (c->SpiritShroudTransitionPending()) return false;
+ 
+ 	clock_t t = std::clock(); /* Function timer start */
+ 
+--- a/zone/zonedb.h
++++ b/zone/zonedb.h
+@@ -589,7 +589,8 @@
+ 	bool LoadMercenaryInfo(Client* c);
+ 	bool LoadCurrentMercenary(Client* c);
+ 	bool SaveMercenary(Merc* m);
+-	bool DeleteMercenary(uint32 mercenary_id);
++	Mercenary::SaveResult SaveMercenaryAtomic(Merc* m, const Mercenary::Payment* payment = nullptr);
++	Mercenary::SaveResult DeleteMercenaryAtomic(uint32 owner_id, uint32 mercenary_id, uint8 slot, const Mercenary::Payment* payment);
+ 
+ 	/* Petitions   */
+ 	void	DeletePetitionFromDB(Petition* wpet);

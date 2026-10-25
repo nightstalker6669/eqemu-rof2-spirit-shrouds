@@ -1,0 +1,191 @@
+{
+  "upstream_repository": "https://github.com/EQEmu/EQEmu",
+  "upstream_commit": "8175ae61874cbf20d7b05102821f6f8a4f4d1c39",
+  "housing_commit": "9aad4cc0857bdd14677dd45ab24f3eafe20d489b",
+  "fellowship_commit": "9382453264f4f84ac7e83a9ee5c9c9a1391c6017",
+  "mercenaries_commit": "00b07c381a738a21aff08867bf186e6c2bfaffb0",
+  "publication_date": "2026-10-24",
+  "scope": "Partial production Spirit Shroud source extension, observed modern Live content adapted to RoF2; excludes provisional starter catalog, tests, fixtures, helpers, raw research, client assets and private runtime data.",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 56,
+      "sha256": "1775e6c2d1445657e83349bf1effbf7ecd1a2cb048567eb96a609d5efe48b0be"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 40,
+      "sha256": "8bc8d3c836921f3449869d3cded2d16e0b2ccc3505301ed55d642fe59f34fd1d"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 35149,
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    {
+      "path": "NOTICE",
+      "bytes": 548,
+      "sha256": "a5ca15bd1411eabd4d74d00de22c47eb69cd4cd4070a4df161f2e82fa0390341"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3646,
+      "sha256": "81a991c0f25d288e8deacccba9a93f1eb3e423550c0a4a095eeaa8aa8a958123"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "bytes": 5456,
+      "sha256": "c5f44ddac02fb77906389f859665cf869b375cef1d441bfce85306acabfdae99"
+    },
+    {
+      "path": "docs/GAMEPLAY.md",
+      "bytes": 4223,
+      "sha256": "8d98bb72a89f7cc0896546d66736b3a554168a7ae9ef2e44f6d04d5005c7a926"
+    },
+    {
+      "path": "docs/INSTALL.md",
+      "bytes": 5107,
+      "sha256": "1bc8afb98d36dd2c8abd94acc7f1c3df5196981a3d488c7c99107cbd8be440aa"
+    },
+    {
+      "path": "docs/KNOWN-GAPS.md",
+      "bytes": 5924,
+      "sha256": "61fe6040d6517fcfb8b6dcddedfdea07075621eaf1cbaa0be11d32122a01ddee"
+    },
+    {
+      "path": "docs/STATUS.md",
+      "bytes": 3879,
+      "sha256": "820a6a60483588f14b3de00c7766f5827dacc67bc821797fc6c689ffbb8dd227"
+    },
+    {
+      "path": "overlay/common/shroud/aa_preview.h",
+      "bytes": 3704,
+      "sha256": "6310e5fd3dbb0ad8cd34d49f445180a540adb6661fec14dbd789efa94d3b4a08"
+    },
+    {
+      "path": "overlay/common/shroud/ability_cast.h",
+      "bytes": 1219,
+      "sha256": "0dc5cb9cc2ba69b99e6152f0ca677c880bde838b23b80c80fdf927ee47d52864"
+    },
+    {
+      "path": "overlay/common/shroud/catalog.h",
+      "bytes": 5941,
+      "sha256": "52fd11cfb3ee8c80b552aa0b566cf0c605f8ebbce60f0545ad953f181b72873c"
+    },
+    {
+      "path": "overlay/common/shroud/experience.h",
+      "bytes": 2824,
+      "sha256": "f8ca2e1e9cd9c650a227303cd0629d6c1d934fe1618016741687cc64a6b4269b"
+    },
+    {
+      "path": "overlay/common/shroud/native_stats.h",
+      "bytes": 1099,
+      "sha256": "47252e57310b457eb132ff27ee7234f99791019d4d3c06755f074b148ed9b71d"
+    },
+    {
+      "path": "overlay/common/shroud/resource_baseline.h",
+      "bytes": 2589,
+      "sha256": "e7200d59f13c36e67878f9f4c9d38430672d09bd912bef889659b71407c39359"
+    },
+    {
+      "path": "overlay/common/shroud/starter_inventory.h",
+      "bytes": 5232,
+      "sha256": "500cfaddb8915ee79b32512e9c4c78a9d320caea42e19b454da962c3a117b0be"
+    },
+    {
+      "path": "overlay/common/shroud/wire.h",
+      "bytes": 3139,
+      "sha256": "176b1f1836a2c3dbdcb805162e4b4a47229f57b999dc259781dcee4d3ed7cb90"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/001_storage.sql",
+      "bytes": 3178,
+      "sha256": "72819211f1c7357fdbe819551ab4958cd670a4f00289420ae4663d2414133452"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/003_parity_storage.sql",
+      "bytes": 4356,
+      "sha256": "e93ab66bfba6edcbf4b11a994a4cc1f498f52c01d5b62d2d2adf291e083297f5"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/004_live_imp_wizard.sql",
+      "bytes": 8161,
+      "sha256": "eac1516c0ab60cfbc855730e39a95f7141c14b71c3d479b047368fdabbd4d0ca"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/005_experience_settlement.sql",
+      "bytes": 872,
+      "sha256": "73a9915699d17d6f2ba87f47a4a803b62dc4856830dda5bf1daf117513cf4ef9"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/006_starter_inventory.sql",
+      "bytes": 1930,
+      "sha256": "f5e36ed594bbda98df994fad2c141964645a5a28e4485bb0479dd2017781a53b"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/007_rof2_enumerable_aa.sql",
+      "bytes": 13054,
+      "sha256": "bf0d518ab6894b499bf85e3553f2543a4e050186991f5e5edeae0617b4437616"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/008_starter_identity.sql",
+      "bytes": 345,
+      "sha256": "3c9a69422945f41178f9f9acb0a9aec2a849e1d90e53e705336e9082795e18f1"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/009_live_captured_catalog.sql",
+      "bytes": 597432,
+      "sha256": "1a358075d4fb9a7498d9ea42e61167866f5024147ecd1453c2b7ac8b8041155f"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/011_live_lower_level_forms.sql",
+      "bytes": 223356,
+      "sha256": "8f9038b3cd02a4c4388429d5c6fbb608006a13014ac7dbdaf9dca9a32d719723"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/012_live_paid_monster_rank_chains.sql",
+      "bytes": 283511,
+      "sha256": "d1646741121e0b393efe6a292e61dee4aa64fce455934be2729b47609e47711e"
+    },
+    {
+      "path": "overlay/zone/client_spirit_shroud.cpp",
+      "bytes": 61873,
+      "sha256": "01e00b7910073ba4c68c60f36c3e847c11e4c9cb0f0b161d86642181384a82a6"
+    },
+    {
+      "path": "patches/base-manifest.json",
+      "bytes": 63781,
+      "sha256": "eca99b44f0b4853b8560494d7a462edbddf668e40281f80cdb45db761ac24030"
+    },
+    {
+      "path": "patches/eqemu-spirit-shrouds.patch",
+      "bytes": 60064,
+      "sha256": "77a648bbd7e4aa1a34c8ccb72d24a26120ebfecb9424166ccd37d2993d6be772"
+    },
+    {
+      "path": "protocol/EVIDENCE.md",
+      "bytes": 1794,
+      "sha256": "a42a1196b45eacec03394bf3997a31ab18eff7615f6d1fbbe372b12d7fde622c"
+    },
+    {
+      "path": "protocol/OPCODES.md",
+      "bytes": 1818,
+      "sha256": "d6fae6b42579b498f92b483679bdabce84c179621403c8a573250a84dcea2eb2"
+    },
+    {
+      "path": "protocol/STRUCTS.md",
+      "bytes": 2368,
+      "sha256": "daca3b701a66ecd8be48a074906345a3d1ea1d0e5943daec58789fee1778e722"
+    },
+    {
+      "path": "protocol/opcodes.json",
+      "bytes": 1265,
+      "sha256": "8711786ade41934176e3e75a242ab1fd527690ed94eaf865dbd7270452f93113"
+    },
+    {
+      "path": "tools/apply_overlay.py",
+      "bytes": 3561,
+      "sha256": "0ead1c20114f04cf126bd225ba9e619e0b4e6ee29f5c525e29276f118e675d11"
+    }
+  ]
+}

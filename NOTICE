@@ -1,0 +1,9 @@
+EQEmu RoF2 Spirit Shrouds
+
+Community source extension for EQEmu, targeting the May 10, 2013 RoF2 client.
+Upstream copyright and GPLv3 notices are preserved in LICENSE and source.
+Modern Live observations inform the adapted content; historical parity is not
+claimed. Requires the exact companion infrastructure in docs/INSTALL.md.
+Independent project, not affiliated with Daybreak Games. EverQuest and related
+names are trademarks of their respective owners. No proprietary client files,
+packet captures or private runtime database are distributed.

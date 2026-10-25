@@ -1,0 +1,65 @@
+{
+  "client": "RoF2 May 10 2013",
+  "opcodes": [
+    {
+      "name": "OP_SpiritShroudSelection",
+      "opcode": "0x2ec3"
+    },
+    {
+      "name": "OP_SpiritShroudRequest",
+      "opcode": "0x2b37"
+    },
+    {
+      "name": "OP_SpiritShroudDetails",
+      "opcode": "0x6c04"
+    },
+    {
+      "name": "OP_SpiritShroudSelect",
+      "opcode": "0x1cd0"
+    },
+    {
+      "name": "OP_SpiritShroudCancel",
+      "opcode": "0x79da"
+    },
+    {
+      "name": "OP_SpiritShroudProgressAppend",
+      "opcode": "0x3823"
+    },
+    {
+      "name": "OP_SpiritShroudProgressReplace",
+      "opcode": "0x541d"
+    },
+    {
+      "name": "OP_SpiritShroudAbilityRequest",
+      "opcode": "0x3acc"
+    },
+    {
+      "name": "OP_SpiritShroudAbilityReady",
+      "opcode": "0x006e"
+    },
+    {
+      "name": "OP_SpiritShroudEquipmentRequest",
+      "opcode": "0x4b25"
+    },
+    {
+      "name": "OP_SpiritShroudEquipment",
+      "opcode": "0x2507"
+    },
+    {
+      "name": "OP_SpiritShroudTransform",
+      "opcode": "0x6562"
+    },
+    {
+      "name": "OP_SpiritShroudBank",
+      "opcode": "0x7b71"
+    },
+    {
+      "name": "OP_SpiritShroudBankItems",
+      "opcode": "0x1115"
+    },
+    {
+      "name": "OP_SpiritShroudBankEmpty",
+      "opcode": "0x0728"
+    }
+  ]
+}
