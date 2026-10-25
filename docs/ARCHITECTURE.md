@@ -1,97 +1,52 @@
 # Architecture
 
-Spirit Shrouds exchange a character's active profile while keeping the original
-profile in transactional storage. The system targets RoF2 and uses modern Live
-content observations where available. Several gameplay policies remain partial;
-[Known gaps](KNOWN-GAPS.md) is part of the implementation contract.
+A versioned session exchanges active character data while preserving the original profile in transactional escrow. Selection and active forms use the same retained content definition. Snapshot manifests, session revision, inventory ownership checks and query-failure generation fence stale writes and uncertain transactions. Disabling entry never removes restoration/recovery access.
 
-## Catalog and retained definitions
+## Destination and native transition
 
-The catalog separates progression family, branch, selected level and versioned
-form definition. Enabled definitions provide the form identity, captured resource
-and attribute targets, equipment, Monster Point budget and available AA ranks.
-Disabled preview records remain outside the playable catalog.
+Before commit, `PrepareSpiritShroudDestination` reads destination PP/EPP, inventory trees, skills/spells, owned AAs, buffs and persistent timers through the same transaction. Immutable item definitions use the existing global cache. Seven standalone profile loaders were corrected to read repository rows through their receiver database, preserving ordinary calls on the global instance. No temporary Client or competing writer lease is constructed.
 
-A session retains its exact form definition. Catalog upgrades must not reinterpret
-an active legacy session as a newer form. Disabling new entry must leave removal
-and recovery available. Selection previews and the active profile use the same
-catalog data, subject to the documented emulator calculation policy.
-
-The production catalog currently enables the eight first branches across fourteen
-levels each. More preview records exist, but preview availability alone does not
-prove an active loadout or a progression threshold.
-
-## Transactional profile exchange
-
-The transition service validates the keeper, character level, inventory cursor,
-combat state, pets, suspended mercenaries and relevant ownership state before an
-exchange. Profile, inventory, currency, spell, skill, AA, buff, pet and timer rows
-are preserved in original-profile storage with a snapshot manifest.
-
-State includes a session identity and monotonically advancing transition revision.
-Database locks and ownership checks fence competing or stale writers. Once a
-profile exchange commits, the old client instance is write-fenced while a
-same-zone reload reconstructs server and client caches from committed storage.
-An ambiguous commit outcome requires recovery from stored state.
-
-The implementation uses the existing shared inventory-ownership safeguards where
-configured. Owning a house or plot is not a shroud prerequisite. Existing housing
-and mercenary infrastructure must still match the integration baseline.
+Ownership-safe swaps exchange worn, personal, bank and cursor inventory and timer maps. Shared-bank/account and trade buckets retain their existing owner. The same Client, entity ID, position, group, raid, target and inventory bridge survive installation. The compact serializer builds all native bytes before commit. Only an explicit list of valid unsupported states selects reload fallback; failed queries, stale transaction identity, malformed profiles and other preparation failures abort before commit. A scoped actual LoadCharacterSkills failure passed precommit rollback and subsequent normal-profile camp/server-restart/relogin conservation. Four real process-crash boundaries around entry/restoration commit and a repeated recovery/settlement case also passed; wider database/ACK-timeout boundaries remain unverified; the saved-pet reload-fallback plain long/short-buff case passed; the bounded original pet/cooldown and long-buff cases passed separately. Completion0x7786 has no embedded revision, so a bounded pending server state associates it only with the committed current transition. The native rule defaults false.
 
 ## Stats and Monster AAs
 
-Captured resource maxima are translated into the contributions needed by the
-server and matching client calculations. Independently captured attributes remain
-separate from equipment, purchased passive bonuses and spell effects. This is a
-resource baseline, not evidence that displayed AC or attack equals an internal
-combat value. Unmeasured combat fields and skills use emulator calculations.
+Captured HP/mana/endurance and attributes remain separate from equipment, purchased passives and buffs. Resource contributions reconcile the server and matching-client formulas. Unmeasured combat and skill fields still use emulator policy; displayed AC/attack are not assumed internal values.
 
-Monster AAs use dedicated local definitions rather than borrowing ordinary class
-AA identities. Some free powers use a single grant-only adapter to present an
-observed higher native rank without inventing predecessor purchases. Paid chains
-retain their actual captured rank costs, prerequisites, level gates and cumulative
-effect vectors. Only the highest owned rank contributes its cumulative effects;
-predecessor effects are not added again.
+Dedicated Monster definitions remain separate from ordinary AAs. Free higher-rank adapters retain captured display ranks without inventing predecessor chains. Paid chains preserve observed costs/effects/prerequisites and form/level availability. Purchases persist point accounting and ownership together; only the highest owned rank's cumulative effects contribute. Migration 013 adds the three previously withheld groups through explicit local target mappings and shroud-only haste handling. Attack Speed purchasing/persistence and inspected rank 1/rank 8 runtime states passed; complete stacking/timing coverage remains pending. Improved Plane Shift endpoint cast/timer cases subsequently passed; Enduring Voice first/max-rank cast/timer and restoration cases also passed; full stacking and failure coverage remains pending.
 
-Purchases validate the selected session's availability, ownership, prerequisites,
-rank order and Monster Point balance. Ownership and spending are stored together.
-The ordinary character's AA balances, allocation settings and definitions remain
-separate. Native saved-set loading remains subject to server purchase validation.
+## Death, resurrection and progression
 
-Three groups remain withheld because their haste or AA cooldown-target semantics
-are unresolved. Warlord's Tenacity deliberately retains the existing RoF2 spell
-behavior as a documented compatibility exception; it is not an exact modern Live
-spell match.
+Positive rewards and death debits update the durable original-profile XP ledger. Corpse provenance binds each applied loss to a character/session; a resurrection claim, refund and corpse completion share one transaction with an exactly-once claim marker. Ordinary and hover callers validate eligibility before completing a corpse. Legacy/untrusted corpse rows cannot authorize a new refund. The loss formula and level-floor policy are emulator rules, not a measured Live multiplier.
 
-## Inventory conservation
+Family progression is separate from normal XP/AA. Definition tables retain NULL for unknown family completion and later-branch unlock XP. Only observed first-branch unlocks are zero. Missing thresholds do not mean complete progression; independent family totals and legacy starter progress remain separate.
 
-Starter equipment has issuance provenance and persistent session-bound tokens;
-loaded item serial numbers alone are insufficient identity. Restoration removes
-identified temporary starter items while preserving earned items. Earned children
-inside a temporary starter container are promoted to independent bank roots.
-Ambiguous provenance or insufficient capacity aborts restoration before commit.
+## Inventory and mercenaries
 
-Earned items move to shroud-bank storage and earned carried currency is combined
-with the original wallet during restoration. Retrieval checks the destination and
-moves ownership transactionally. Current retrieval uses a reload. Bank expiry is
-not enabled; storage lifetime does not yet match the reported Live timer policy.
+Session-bound starter provenance survives runtime serial changes. Complete outgoing item trees are checked before bank/trade/sale; temporary supplies cannot leave the active profile. Earned items/children survive restoration through shroud-bank custody. New session inventory_policy 1 keeps ordinary personal-bank roots/children and bank coin live; legacy policy 0 retains its exact original full-bank snapshot. Shared bank stays inaccessible. Single-item bank operations are supported; direct-write bulk bank operations remain restricted.
 
-## Experience and recovery limits
+Active mercenaries suspend through their existing durable lifecycle before exchange. Existing contracts do not acquire another hire fee. A first hire while shrouded records the full original-level hire liability with the contract. Restoration reprices for earned level-ups but always permits original recovery; unpaid contracts stay suspended until the fee is settled atomically on normal unsuspend. This insufficient-funds behavior is an explicit compatibility policy because the exact Live response is unmeasured. Ordinary activation/upkeep remains separate, including Bayle-first upkeep.
 
-Positive rewards update a durable original-character XP/AA ledger and a separate
-family-progress record. Entry captures the original allocation, XP curve and caps.
-Restoration settles the ledger and original profile in the same transaction as the
-session's restored marker, preventing repeated removal from settling it twice.
-The temporary form does not gain character levels.
+Regular pets are checkpointed before escrow and detached only after commit without a stale save. Populated destination pet/complex appearance states use the full reload fallback. Charmed or engaged pets prevent entry. No ordinary pet/charm powers are granted to a form without its loadout evidence. Shroud-bank expiry deletion remains disabled.
 
-The current positive ledger does not implement death debits or corpse-domain
-refunds. Temporary possessions remain with the shrouded player on death, and
-shrouded corpses advertise no refundable XP. Resurrection is provisionally refused
-while shrouded, with a known hover-path defect described in
-[Known gaps](KNOWN-GAPS.md). The corpse provenance schema is not a completed
-loss/refund implementation.
 
-Original buff and cooldown rows are retained, but their full Live suspension and
-resumption semantics are not established. Direct settlement also bypasses some
-ordinary XP/level event paths. Neither successful profile exchange nor migration
-validation establishes those behaviors.
+## Native recovery-bank retrieval
+
+For supported RoF2 inventory trees, the service stages the exact destination item and its ordinary ItemPacketTrade encoding inside the ownership transaction before commit. It installs that owned tree into the same server inventory, publishes the item packet and the native action2 bank-row acknowledgement, then releases the write fence. Runtime serials are synchronized in the same transaction. Precommit Get denials complete the pending native request with an all-ones key while leaving rows intact; postcommit uncertainty disconnects for authoritative recovery. Unsupported item reconstruction retains logged reload fallback. Actual native opening, item 1001 inspection, plain-item retrieval/row acknowledgement without reload and expired-Get denial passed with custody conservation. Bag/child and interrupted-commit acceptance remains pending.
+
+Raid member class/level publication is staged transactionally from the destination profile and updated in the existing Raid object after commit, preserving membership. The native completion acknowledgement refreshes world presence. These source integrations do not establish physical multi-client raid/group acceptance.
+
+Shared inventory writer reservations and epoch/token checks also apply when mercenaries are enabled with housing gameplay disabled, and a retained reservation is validated during shroud transactions. This preserves the existing mercenary payment/debt ownership contract without enabling housing gameplay or making house ownership a shroud prerequisite. Quest reward/shroud restoration passed with housing gameplay disabled. Mercenary payment/debt and the remaining housing-disabled interaction combination still require their own physical verification.
+
+Shroud active-AA cooldown checks use the queried rank's own effective reuse against the native shared timer start, rather than another ability's stored duration. Storage retains the maximum offered raw/effective horizon so the start survives later purchases and reconnects. Failed casts resend the prior start instead of clearing a longer shared cooldown. Ordinary AA handling is unchanged. Isolated shared-six/nine-second, zero-reuse, horizon, failure and normal-path comparison cases passed; actual endpoint alignment subsequently passed for the documented Plane Shift and first-rank Voice cases; the full shared-timer matrix remains pending.
+
+Checked inventory loading also applies to RoF2 mercenary ownership or an existing writer reservation when housing gameplay is disabled. A genuine empty inventory may load after successful repository queries, shared-bank loading and lease checks. Inventory/evolving/shared-bank query failure is rejected using success-aware snapshots and a query-failure generation guard. Housing-only ornament behavior stays housing-only. This narrow empty-inventory login correction passed 51 extracted failure/fence and version/rule matrix assertions and actual translation-unit syntax; actual housing-disabled main and genuine-empty peer logins passed.
+
+The shared database loader receives an optional ownership fence from the zone adapter; it does not call zone-only reservation methods. The adapter supplies that fence for a retained reservation, or applicable RoF2 housing/mercenary ownership rules. With neither feature nor a reservation, the original legacy admission path remains unchanged. The final two-file correction passed 51 extracted callback/query-failure and version/rule matrix assertions and both translation-unit syntax checks. Full world/zone linking and corrected empty-login acceptance remain deployment checks; syntax alone is not link or runtime proof.
+
+Client-version compatibility is explicit: a non-RoF2 client with only the global mercenary rule enabled and no retained reservation follows the previous legacy loader. Housing-on retains its existing checked behavior; an actual retained reservation still requires a valid fence across rule changes. These final predicates were checked across all 16 housing/mercenary/version/ticket combinations.
+
+Native buff replay uses the existing RoF2 OP_Buff operation3 to populate the empty compact-profile affects; ordinary duration updates retain operation2. The recreate flag is RoF2-only and defaults false. Valid saved nonzero counter/rune states select explicit reload fallback; query failures still abort before commit. This correction passed isolated encoder/classification checks; long-buff288 native acceptance subsequently passed without reload. Plain short-buff6886 native acceptance passed; the separate saved-pet reload-fallback plain long/short-buff case also passed.
+
+Song slots are captured only inside the entering-shroud transaction after ordinary checkpointing, so rollback cannot grant ordinary short-buff logout persistence. On reload restoration, the song loader accepts only the exact latest completed shroud restoration (entry revision plus one equals current revision), validates saved slot/payload/ownership, and runs before profile/bonus construction. Ordinary SaveBuffs/LoadBuffs policy is unchanged; subsequent ordinary saves remove Song rows normally. The short-buff correction has source-extracted capture/load and transaction rollback/commit checks; plain native288/6886 validation passed; the separate saved-pet reload-fallback plain long/short-buff case also passed.
+
+For reload restoration, a private one-shot pending flag replays only validated restored Song slots through RoF2 OP_Buff operation3 during CompleteConnect, after the login profile and before the icon list. The flag clears before sending and on failed/nonmatching loads; ordinary logins do not gain general Song persistence. Scalar replay is source-backed and passes extracted one-shot/ordering checks; actual plain long/short native and saved-pet reload-fallback acceptance passed; complex counter/rune client representation remains unproven.

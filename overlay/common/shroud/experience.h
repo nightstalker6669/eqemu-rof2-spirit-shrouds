@@ -55,4 +55,35 @@ inline void ApplyExperience(ExperienceState& state, uint64_t normal, uint64_t aa
  state.aa_points+=static_cast<uint32_t>(granted);
  state.aa=state.aa_points==cap ? 0 : total%state.aa_unit;
 }
+// Existing server death rules choose the requested raw loss using the active
+// form. Only the original pending normal-XP domain is debited. The selected
+// form, AA pool, level high-water mark and already-earned training points stay
+// unchanged. This is explicit emulator policy, not a claimed Live loss formula.
+inline uint64_t ApplyDeathLoss(ExperienceState& state, uint64_t requested, bool keep_level)
+{
+ ValidateExperience(state);
+ if(!requested)return 0;
+ const uint64_t floor=keep_level ? std::min<uint64_t>(state.normal,state.thresholds[state.level]) : std::min<uint64_t>(state.normal,1);
+ const auto applied=std::min<uint64_t>(requested,state.normal-floor);
+ state.normal-=applied;
+ if(applied && !keep_level)while(state.level>1 && state.normal<state.thresholds[state.level])--state.level;
+ return applied;
+}
+inline uint64_t ResurrectionRefund(uint64_t applied_loss, uint32_t percentage)
+{
+ if(percentage>100)throw std::invalid_argument("invalid shroud resurrection percentage");
+ // Split before multiplication to avoid overflow while retaining exact integer
+ // percentage rounding, including losses smaller than one hundred XP.
+ return (applied_loss/100)*percentage+((applied_loss%100)*percentage)/100;
+}
+inline uint64_t ApplyResurrection(ExperienceState& state,uint64_t applied_loss,uint32_t percentage,int unused_aa_cap)
+{
+ ValidateExperience(state);
+ const auto refund=ResurrectionRefund(applied_loss,percentage);
+ if(!refund)return 0; // Corpse-gating cannot grant levels or training points.
+ const auto before=state.normal;
+ ApplyExperience(state,refund,0,unused_aa_cap);
+ return state.normal-before;
+}
+
 }

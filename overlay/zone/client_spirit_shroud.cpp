@@ -1,7 +1,17 @@
 #include "client.h"
 #include "entity.h"
+#include "merc.h"
+#include "npc.h"
 #include "zone.h"
 #include "inventory_session_owner.h"
+#include "spirit_shroud_destination.h"
+#include "housing_item_reconstruction.h"
+#include "../common/repositories/inventory_repository.h"
+#include "../common/repositories/character_buffs_repository.h"
+#include "fellowship_campsite_bonuses.h"
+#include "../common/opcodemgr.h"
+#include "groups.h"
+#include "raids.h"
 #include "../common/eqemu_config.h"
 #include "../common/rulesys.h"
 #include "../common/shroud/catalog.h"
@@ -17,6 +27,7 @@
 #include <cmath>
 #include <ctime>
 #include <limits>
+#include <cstring>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -48,6 +59,47 @@ uint64_t N(const char* text) {
  std::string s(text);size_t end=0;auto v=std::stoull(s,&end);if(end!=s.size()||s[0]=='-')throw std::runtime_error("shroud invalid number");return v;
 }
 std::string S(uint64_t n){return std::to_string(n);}
+std::string PersonalBankDomain() {
+ return "(slot_id BETWEEN "+S(EQ::invslot::BANK_BEGIN)+" AND "+S(EQ::invslot::BANK_END)+
+  " OR slot_id BETWEEN "+S(EQ::invbag::BANK_BAGS_BEGIN)+" AND "+S(EQ::invbag::BANK_BAGS_END)+")";
+}
+
+
+// Ordinary saves intentionally persist only long buffs. Capture Song slots only
+// inside an entering-shroud transaction, so a failed transition cannot change
+// ordinary camp/logout persistence. Slot offsets are client constants, not class.
+void CaptureSpiritShroudShortBuffs(ZoneDatabase& db, Client& client)
+{
+ const int first=client.GetMaxBuffSlots(),end=first+client.GetMaxSongSlots();
+ if(client.ClientVersion()!=EQ::versions::ClientVersion::RoF2 || first<0 || end<first ||
+    end>client.GetMaxTotalSlots() || end>int(UINT8_MAX)+1 || !client.GetBuffs())
+  throw std::runtime_error("shroud short buff slot domain");
+ std::vector<CharacterBuffsRepository::CharacterBuffs> rows;
+ for(int slot=first;slot<end;++slot){
+  const auto& b=client.GetBuffs()[slot];
+  if(!IsValidSpell(b.spellid) || IsFellowshipCampsiteAuraBuff(b.spellid,b.caster_name,sizeof(b.caster_name)))continue;
+  if(!spells[b.spellid].short_buff_box || b.dot_rune>INT32_MAX || b.instrument_mod>INT32_MAX)
+   throw std::runtime_error("shroud short buff payload");
+  auto e=CharacterBuffsRepository::NewEntity();
+  // Runtime spellid/casterlevel already use the repository uint16/uint8 widths.
+  e.character_id=client.CharacterID();e.slot_id=uint8_t(slot);e.spell_id=b.spellid;e.caster_level=b.casterlevel;
+  e.caster_name=std::string(b.caster_name,strnlen(b.caster_name,sizeof(b.caster_name)));
+  if(e.caster_name.size()>=sizeof(b.caster_name))throw std::runtime_error("shroud short buff caster");
+  e.ticsremaining=b.ticsremaining;e.counters=b.counters;e.numhits=b.hit_number;
+  e.melee_rune=b.melee_rune;e.magic_rune=b.magic_rune;e.persistent=b.persistant_buff;
+  e.dot_rune=b.dot_rune;e.caston_x=b.caston_x;e.caston_y=b.caston_y;e.caston_z=b.caston_z;
+  e.ExtraDIChance=b.ExtraDIChance;e.instrument_mod=b.instrument_mod;
+  rows.push_back(std::move(e));
+ }
+ // Save(2) ran before this transaction and replaced the ordinary buff rows.
+ auto old=Q(db,"SELECT COUNT(*) FROM character_buffs WHERE character_id="+S(client.CharacterID())+" AND slot_id>="+S(first));
+ if(old.RowCount()!=1 || N(old.begin()[0]))throw std::runtime_error("shroud short buff checkpoint changed");
+ const auto failures=db.QueryFailureGeneration();
+ if(!rows.empty() && CharacterBuffsRepository::InsertMany(db,rows)!=int(rows.size()))
+  throw std::runtime_error("shroud short buff checkpoint failed");
+ if(db.QueryFailureGeneration()!=failures)throw std::runtime_error("shroud short buff checkpoint query failed");
+}
+
 uint64_t Now(){return uint64_t(std::time(nullptr));}
 std::string Hex(const uint8_t* p,size_t n) {
  const char* digits="0123456789ABCDEF";std::string s;
@@ -116,6 +168,14 @@ std::vector<Template> Catalog(Database& db, bool include_disabled = false, uint3
 bool Offered(Database& db, Client& c, const Template& t)
 {
  if(!SpiritShroud::Offered(t, RuleB(Character,AllowTestSpiritShrouds)))return false;
+ // Retained templates remain restorable; only new entry uses progression gates.
+ if (!t.test_only) {
+  auto branch=Q(db,"SELECT b.unlock_xp FROM spirit_shroud_branch_progression b JOIN spirit_shroud_progression_definitions d ON d.progression_id=b.progression_id AND d.definition_version=b.definition_version WHERE b.progression_id="+S(t.progression)+" AND b.branch_id="+S(t.branch));
+  if(branch.RowCount()!=1 || !branch.begin()[0])return false;
+  auto progress=Q(db,"SELECT experience FROM spirit_shroud_progress WHERE character_id="+S(c.CharacterID())+" AND progression_id="+S(t.progression));
+  const auto xp=progress.RowCount()?N(progress.begin()[0]):0;
+  if(xp<N(branch.begin()[0]) || xp<t.unlock_xp)return false;
+ }
  if(t.entitlement_key.empty())return true;
  auto owned=Q(db,"SELECT character_id FROM spirit_shroud_entitlements WHERE character_id="+S(c.CharacterID())+" AND entitlement_key='"+db.Escape(t.entitlement_key)+"'");
  return owned.RowCount()==1;
@@ -144,7 +204,7 @@ std::string ExperienceValues(Database& db,const SpiritShroud::ExperienceState& s
   S(state.max_level)+",'"+db.Escape(nlohmann::json(state.thresholds).dump())+"'";
 }
 void Schema(Database& db) {
- std::set<std::string> names={"spirit_shroud_state","spirit_shroud_progress","spirit_shroud_templates","spirit_shroud_spells","spirit_shroud_bank_inventory","spirit_shroud_abilities","spirit_shroud_sessions","spirit_shroud_snapshot_manifest","spirit_shroud_entitlements","spirit_shroud_allocations","spirit_shroud_experience_state","spirit_shroud_experience_events","spirit_shroud_starter_equipment","spirit_shroud_starter_provenance"};
+ std::set<std::string> names={"spirit_shroud_state","spirit_shroud_progress","spirit_shroud_templates","spirit_shroud_spells","spirit_shroud_bank_inventory","spirit_shroud_abilities","spirit_shroud_sessions","spirit_shroud_snapshot_manifest","spirit_shroud_entitlements","spirit_shroud_allocations","spirit_shroud_experience_state","spirit_shroud_experience_events","spirit_shroud_starter_equipment","spirit_shroud_starter_provenance","spirit_shroud_mercenary_fees"};
  for(auto t:Tables){names.insert(t.name);names.insert("shroud_original_"+std::string(t.name));}
  std::string list;for(auto& n:names){if(!list.empty())list+=",";list+="'"+n+"'";}
  auto r=Q(db,"SELECT table_name,engine FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ("+list+")");
@@ -179,7 +239,7 @@ void LockActor(Database& db,Client& c) {
  auto actor=S(c.CharacterID());
  auto r=Q(db,"SELECT id FROM character_data WHERE id="+actor+" AND account_id="+S(c.AccountID())+" AND deleted_at IS NULL FOR UPDATE");
  if(r.RowCount()!=1)throw std::runtime_error("shroud actor missing");
- if(RuleB(Housing,EnablePlayerHousing)) {
+ if(RuleB(Housing,EnablePlayerHousing) || RuleB(Mercs,AllowMercs) || c.InventorySessionReleaseTicket()) {
   auto ticket=c.InventorySessionReleaseTicket();auto lease=ticket?ticket->SnapshotFor(c):std::nullopt;
   if(!lease||!c.HasInventorySessionReservation())throw std::runtime_error("shroud writer session missing");
   auto rows=Q(db,"SELECT epoch,HEX(token),HEX(process_key),HEX(client_key),active FROM housing_inventory_sessions WHERE character_id="+actor+" AND account_id="+S(c.AccountID())+" FOR UPDATE");
@@ -190,6 +250,48 @@ void LockActor(Database& db,Client& c) {
   if(Housing::CoinPending::Inspect(db,c.CharacterID(),true)!=Housing::CoinPending::State::Clear)throw std::runtime_error("shroud coin operation pending");
  }
 }
+}
+
+void Client::BeginSpiritShroudNativeAcknowledgement(uint64_t revision)
+{
+ // Called only after the committed destination has replaced every server cache.
+ // The native acknowledgement has no revision token; serialize exchanges on this
+ // connection and never let it commit or reinstall an old profile.
+ if (!m_spirit_shroud_transition || revision != m_spirit_shroud_revision ||
+     m_spirit_shroud_native_pending) throw std::runtime_error("shroud native cache revision");
+ m_spirit_shroud_native_revision = revision;
+ m_spirit_shroud_native_deadline = Now() + 30;
+ m_spirit_shroud_native_pending = true;
+}
+
+bool Client::ProcessSpiritShroudNativeTransition()
+{
+ if (!m_spirit_shroud_native_pending) return true;
+ if (m_spirit_shroud_native_revision != m_spirit_shroud_revision ||
+     Now() > m_spirit_shroud_native_deadline) {
+  m_spirit_shroud_native_pending = false;
+  m_spirit_shroud_transition = true;
+  LogError("Spirit Shroud native completion timeout for character [{}], revision [{}]", CharacterID(), m_spirit_shroud_native_revision);
+  Disconnect();
+  return false;
+ }
+ return true;
+}
+
+void Client::Handle_OP_SpiritShroudComplete(const EQApplicationPacket* packet)
+{
+ if (!packet || packet->size || ClientVersion() != EQ::versions::ClientVersion::RoF2 ||
+     !m_spirit_shroud_native_pending || !m_spirit_shroud_transition) return;
+ if (!ProcessSpiritShroudNativeTransition()) return;
+ m_spirit_shroud_native_pending = false;
+ m_spirit_shroud_native_deadline = 0;
+ m_spirit_shroud_transition = false;
+ // Publish the committed active class/level only after its native completion.
+ UpdateWho();
+ m_spirit_shroud_resource_refreshes = IsSpiritShrouded() ? 3 : 0;
+ LogInfo("Spirit Shroud native completion for character [{}], revision [{}], template [{}]", CharacterID(), m_spirit_shroud_revision, m_spirit_shroud_template);
+ SendHPUpdate(true); SendManaUpdate(); SendEnduranceUpdate();
+ SendSpiritShroudProgress();
 }
 
 bool Client::SaveSpiritShroudCheckpoint()
@@ -217,7 +319,8 @@ bool Client::SaveSpiritShroudCheckpoint()
 
 bool Client::LoadSpiritShroudState()
 {
- m_spirit_shroud_template=0;m_pp.unknown0112=0;
+ m_spirit_shroud_restored_short_buffs_pending=false;
+ m_spirit_shroud_template=0;m_pp.unknown0112=0;m_spirit_shroud_personal_bank=false;
  m_pp.shroud_native_stats_valid=false;
  m_pp.shroud_native_resources_valid=false;
  std::fill(std::begin(m_pp.shroud_native_stats),std::end(m_pp.shroud_native_stats),0);
@@ -238,9 +341,11 @@ bool Client::LoadSpiritShroudState()
    ValidateSnapshot(database,CharacterID(),m_spirit_shroud_session_id);
    Template definition;
    if(m_spirit_shroud_session_id){
-    auto session=Q(database,"SELECT template_json,template_id,content_version,entry_revision FROM spirit_shroud_sessions WHERE id="+S(m_spirit_shroud_session_id)+" AND character_id="+S(CharacterID())+" AND phase='active'");
+    auto session=Q(database,"SELECT template_json,template_id,content_version,entry_revision,inventory_policy FROM spirit_shroud_sessions WHERE id="+S(m_spirit_shroud_session_id)+" AND character_id="+S(CharacterID())+" AND phase='active'");
     if(session.RowCount()!=1)throw std::runtime_error("shroud active session missing");auto row=session.begin();
     if(!row[0]||N(row[1])!=m_spirit_shroud_template||N(row[3])!=m_spirit_shroud_revision)throw std::runtime_error("shroud session identity changed");
+    if(N(row[4])>1)throw std::runtime_error("shroud inventory policy unavailable");
+    m_spirit_shroud_personal_bank=N(row[4])==1;
     definition=SpiritShroud::RestoreSnapshot(row[0]);
     if(definition.id!=m_spirit_shroud_template||definition.content_version!=N(row[2]))throw std::runtime_error("shroud retained version changed");
     auto allocated=Q(database,"SELECT COALESCE(SUM(paid_points),0) FROM spirit_shroud_allocations WHERE session_id="+S(m_spirit_shroud_session_id));
@@ -261,6 +366,62 @@ bool Client::LoadSpiritShroudState()
   return true;
  }catch(const std::exception& error){
   LogError("Spirit Shroud recovery refused for character [{}]: [{}]",CharacterID(),error.what());
+  m_spirit_shroud_transition=true;Disconnect();return false;
+ }
+}
+
+// Connect calls this after ordinary LoadBuffs and before the player profile and
+// CalcBonuses are built. Only the exact latest completed restoration authorizes
+// reading Song rows. A later ordinary Save removes those rows as usual; normal
+// characters do not acquire general short-buff logout persistence.
+bool Client::LoadSpiritShroudRestoredShortBuffs()
+{
+ m_spirit_shroud_restored_short_buffs_pending=false;
+ if(ClientVersion()!=EQ::versions::ClientVersion::RoF2 || m_spirit_shroud_template ||
+    m_spirit_shroud_session_id || !m_spirit_shroud_revision)return true;
+ const auto failures=database.QueryFailureGeneration();
+ try{
+  auto latest=Q(database,"SELECT entry_revision,phase FROM spirit_shroud_sessions WHERE character_id="+S(CharacterID())+" ORDER BY entry_revision DESC LIMIT 1");
+  if(!latest.RowCount())return true;
+  if(latest.RowCount()!=1 || !latest.begin()[1])throw std::runtime_error("shroud short buff restoration identity");
+  const auto entry=N(latest.begin()[0]);
+  if(entry==UINT64_MAX || entry+1!=m_spirit_shroud_revision || std::string(latest.begin()[1])!="restored")return true;
+  const int first=GetMaxBuffSlots(),end=first+GetMaxSongSlots();
+  if(first<0 || end<first || end>GetMaxTotalSlots() || end>int(UINT8_MAX)+1 || !buffs)throw std::runtime_error("shroud short buff restoration slots");
+  auto rows=CharacterBuffsRepository::GetWhere(database,"character_id="+S(CharacterID())+" AND slot_id>="+S(first)+" AND slot_id<"+S(end));
+  if(database.QueryFailureGeneration()!=failures)throw std::runtime_error("shroud short buff restoration query failed");
+  if(rows.empty())return true;
+  // Match LockActor's feature/retained-ticket fence. Both features disabled
+  // continue using ordinary authenticated character admission, not a new
+  // housing/mercenary prerequisite merely because a past session exists.
+  if((RuleB(Housing,EnablePlayerHousing) || RuleB(Mercs,AllowMercs) || InventorySessionReleaseTicket()) &&
+     !HasInventorySessionReservation())throw std::runtime_error("shroud short buff restoration ownership");
+  std::set<unsigned> slots;
+  for(const auto& e:rows){
+   if(e.character_id!=CharacterID() || e.slot_id<unsigned(first) || e.slot_id>=unsigned(end) ||
+      !slots.insert(e.slot_id).second || !IsValidSpell(e.spell_id) || !spells[e.spell_id].short_buff_box ||
+      e.caster_name.size()>=sizeof(buffs[0].caster_name) || e.persistent>1 || e.dot_rune<0 || e.instrument_mod<0)
+    throw std::runtime_error("shroud short buff restoration payload");
+  }
+  for(const auto& e:rows){
+   if(IsFellowshipCampsiteAuraBuff(e.spell_id,e.caster_name.data(),e.caster_name.size()))continue;
+   // Keep the ordinary loader's actor-effect exclusions on reload fallback.
+   if(IsEffectInSpell(e.spell_id,SpellEffect::Charm) ||
+      (IsEffectInSpell(e.spell_id,SpellEffect::Illusion) && !e.persistent))continue;
+   auto& b=buffs[e.slot_id];b={};b.spellid=e.spell_id;b.casterlevel=e.caster_level;
+   if(auto* caster=entity_list.GetClientByName(e.caster_name.c_str())){
+    b.casterid=caster->GetID();b.client=true;strn0cpy(b.caster_name,caster->GetName(),sizeof(b.caster_name));
+   }
+   b.ticsremaining=e.ticsremaining;b.counters=e.counters;b.hit_number=e.numhits;
+   b.melee_rune=e.melee_rune;b.magic_rune=e.magic_rune;b.persistant_buff=e.persistent!=0;
+   b.dot_rune=e.dot_rune;b.caston_x=e.caston_x;b.caston_y=e.caston_y;b.caston_z=e.caston_z;
+   b.ExtraDIChance=e.ExtraDIChance;b.instrument_mod=e.instrument_mod;
+   m_spirit_shroud_restored_short_buffs_pending=true;
+  }
+  return true;
+ }catch(const std::exception& e){
+  m_spirit_shroud_restored_short_buffs_pending=false;
+  LogError("Spirit Shroud short buff recovery refused for character [{}]: [{}]",CharacterID(),e.what());
   m_spirit_shroud_transition=true;Disconnect();return false;
  }
 }
@@ -338,11 +499,16 @@ void Client::Handle_OP_SpiritShroudPreview(const EQApplicationPacket* p) {
 void Client::ChangeSpiritShroud(uint32_t id) {
  if((id&&!RuleB(Character,EnableSpiritShrouds))||ClientVersion()!=EQ::versions::ClientVersion::RoF2||!Keeper(*this)||m_spirit_shroud_transition)return;
  if((id&&IsSpiritShrouded())||(!id&&!IsSpiritShrouded()))return;
- if(IsDead()||GetHP()<=0||IsEngaged()||GetAggroCount()||GetPet()||GetMerc()||IsTrader()||IsBuyer()||IsLooting()||GetTradeskillObject()||(trade && trade->state!=TradeNone)||!GetInv().CursorEmpty()||m_pp.copper_cursor||m_pp.silver_cursor||m_pp.gold_cursor||m_pp.platinum_cursor){
-  Message(Chat::Yellow,"Leave combat, dismiss your pet, suspend your mercenary, close trading, and empty your item and coin cursor before changing forms.");return;
+ if(IsDead()||GetHP()<=0||IsCasting()||HasActiveSong()||IsMezzed()||IsStunned()||IsEngaged()||GetAggroCount()||
+    (GetPet() && (!GetPet()->IsNPC() || GetPet()->IsCharmed() || GetPet()->IsEngaged()))||IsTrader()||IsBuyer()||IsLooting()||GetTradeskillObject()||(trade && trade->state!=TradeNone)||!GetInv().CursorEmpty()||m_pp.copper_cursor||m_pp.silver_cursor||m_pp.gold_cursor||m_pp.platinum_cursor){
+  Message(Chat::Yellow,"Leave combat, stop casting or singing, release any charmed pet, close trading, and empty your item and coin cursor before changing forms.");return;
  }
+ // Suspend through the existing durable lifecycle before taking the snapshot.
+ // Failure leaves the current form intact; success never dismisses the contract.
+ if(auto* merc=GetMerc()){if(!merc->Suspend()){Message(Chat::Red,"Your mercenary could not be suspended; your form has not changed.");return;}}
  if(!SaveSpiritShroudCheckpoint()){Message(Chat::Red,"Your character could not be saved; your form has not changed.");return;}
- Database db;auto* cfg=EQEmuConfig::get();bool started=false,committing=false;
+ ZoneDatabase db;auto* cfg=EQEmuConfig::get();bool started=false,committing=false;
+ uint32_t raid_profile_id=0;uint8_t raid_profile_class=0,raid_profile_level=0;
  try {
   if(!cfg||!db.Connect(cfg->DatabaseHost,cfg->DatabaseUsername,cfg->DatabasePassword,cfg->DatabaseDB,cfg->DatabasePort,"spirit-shroud"))throw std::runtime_error("shroud connection");
   Schema(db);Q(db,"START TRANSACTION");started=true;
@@ -353,18 +519,19 @@ void Client::ChangeSpiritShroud(uint32_t id) {
   Q(db,"INSERT INTO spirit_shroud_state(character_id) VALUES ("+actor+") ON DUPLICATE KEY UPDATE character_id=character_id");
   auto state=Q(db,"SELECT template_id,revision,active_session_id FROM spirit_shroud_state WHERE character_id="+actor+" FOR UPDATE");
   if(state.RowCount()!=1||N(state.begin()[0])!=m_spirit_shroud_template||N(state.begin()[1])!=m_spirit_shroud_revision)throw std::runtime_error("shroud state changed");
-  // Suspended contracts remain owned and unchanged. No active contract may follow
-  // a temporary player level or be upgraded by this profile swap.
+  // Active contracts must have been durably suspended before the profile swap.
   auto mercs=Q(db,"SELECT MercID FROM mercs WHERE OwnerCharacterID="+actor+" AND IsSuspended=0 FOR UPDATE");
   if(mercs.RowCount())throw std::runtime_error("suspend every active mercenary before shrouding");
   if(id) {
    auto all=Catalog(db);auto found=std::find_if(all.begin(),all.end(),[&](const Template& t){return t.id==id;});
    if(found==all.end()||!Offered(db,*this,*found)||found->level>GetLevel()||Progress(db,CharacterID(),found->progression)<found->unlock_xp)throw std::runtime_error("shroud template not available");auto t=*found;
    auto bank=Q(db,"SELECT slot_id FROM spirit_shroud_bank_inventory WHERE character_id="+actor+" FOR UPDATE");if(bank.RowCount())throw std::runtime_error("empty the shroud bank first");
-   Q(db,"INSERT INTO spirit_shroud_sessions(character_id,entry_revision,template_id,content_version,template_json,entered_at,experience_version) VALUES ("+actor+","+S(m_spirit_shroud_revision+1)+","+S(t.id)+","+S(t.content_version)+",'"+db.Escape(SpiritShroud::Snapshot(t))+"',"+S(Now())+",1)");
+   Q(db,"INSERT INTO spirit_shroud_sessions(character_id,entry_revision,template_id,content_version,template_json,entered_at,experience_version,inventory_policy) VALUES ("+actor+","+S(m_spirit_shroud_revision+1)+","+S(t.id)+","+S(t.content_version)+",'"+db.Escape(SpiritShroud::Snapshot(t))+"',"+S(Now())+",1,1)");
    auto session_id=N(Q(db,"SELECT LAST_INSERT_ID()").begin()[0]);
+   CaptureSpiritShroudShortBuffs(db,*this);
    for(auto table:Tables){std::string name=table.name,key=table.key;auto where=" WHERE "+key+"="+actor;
-    auto old=Q(db,"SELECT "+key+" FROM shroud_original_"+name+where+" FOR UPDATE");if(old.RowCount())throw std::runtime_error("shroud recovery snapshot already exists");
+    if(name=="inventory")where+=" AND NOT "+PersonalBankDomain();
+    auto old=Q(db,"SELECT "+key+" FROM shroud_original_"+name+" WHERE "+key+"="+actor+" FOR UPDATE");if(old.RowCount())throw std::runtime_error("shroud recovery snapshot already exists");
     Q(db,"INSERT INTO shroud_original_"+name+" SELECT * FROM "+name+where);
     Q(db,"INSERT INTO spirit_shroud_snapshot_manifest(session_id,table_name,row_count) SELECT "+S(session_id)+",'"+name+"',COUNT(*) FROM shroud_original_"+name+where);
     if(name!="character_data"&&name!="character_currency")Q(db,"DELETE FROM "+name+where);
@@ -424,12 +591,15 @@ void Client::ChangeSpiritShroud(uint32_t id) {
    Q(db,"UPDATE spirit_shroud_state SET template_id="+S(id)+",active_session_id="+S(session_id)+",revision=revision+1 WHERE character_id="+actor);
   } else {
    ValidateSnapshot(db,CharacterID(),m_spirit_shroud_session_id);
+   bool personal_bank=false;
+   if(m_spirit_shroud_session_id){auto policy=Q(db,"SELECT inventory_policy FROM spirit_shroud_sessions WHERE id="+S(m_spirit_shroud_session_id)+" AND character_id="+actor+" FOR UPDATE");if(policy.RowCount()!=1 || N(policy.begin()[0])>1)throw std::runtime_error("shroud inventory policy unavailable");personal_bank=N(policy.begin()[0])==1;}
+   const auto carried=personal_bank?" AND NOT "+PersonalBankDomain():std::string();
    auto bank=Q(db,"SELECT slot_id FROM spirit_shroud_bank_inventory WHERE character_id="+actor+" FOR UPDATE");if(bank.RowCount())throw std::runtime_error("unexpected occupied shroud bank");
    if(m_spirit_shroud_session_id){
     std::vector<SpiritShroud::StarterIssuedItem> issued;
     for(auto row:Q(db,"SELECT guid,item_id,issued_slot,issued_token FROM spirit_shroud_starter_provenance WHERE session_id="+S(m_spirit_shroud_session_id)+" FOR UPDATE"))issued.push_back({N(row[0]),uint32_t(N(row[1])),uint32_t(N(row[2])),row[3]?std::optional<std::string>(row[3]):std::nullopt});
     std::vector<SpiritShroud::StarterHeldItem> held;
-    for(auto row:Q(db,"SELECT slot_id,item_id,guid,custom_data FROM inventory WHERE character_id="+actor+" FOR UPDATE")){
+    for(auto row:Q(db,"SELECT slot_id,item_id,guid,custom_data FROM inventory WHERE character_id="+actor+carried+" FOR UPDATE")){
      auto* data=database.GetItem(uint32_t(N(row[1])));if(!data)throw std::runtime_error("shroud item definition missing");
      held.push_back({uint32_t(N(row[0])),uint32_t(N(row[1])),N(row[2]),data->ItemClass==EQ::item::ItemClassBag,row[3]?row[3]:""});
     }
@@ -442,8 +612,11 @@ void Client::ChangeSpiritShroud(uint32_t id) {
     for(auto slot:removal.discard)Q(db,"DELETE FROM inventory WHERE character_id="+actor+" AND slot_id="+S(slot));
     for(auto slots:removal.promote)Q(db,"UPDATE inventory SET slot_id="+S(slots.second)+" WHERE character_id="+actor+" AND slot_id="+S(slots.first));
    }
-   Q(db,"INSERT INTO spirit_shroud_bank_inventory SELECT * FROM inventory WHERE character_id="+actor);
-   // Earned carried coins return with the player; original bank money is held.
+   Q(db,"INSERT INTO spirit_shroud_bank_inventory SELECT * FROM inventory WHERE character_id="+actor+carried);
+   // New sessions retain the live personal-bank domain. Legacy sessions still
+   // restore the exact bank snapshot they took before this policy existed.
+   if(personal_bank)Q(db,"UPDATE shroud_original_character_currency b JOIN character_currency c ON c.id=b.id SET b.copper_bank=c.copper_bank,b.silver_bank=c.silver_bank,b.gold_bank=c.gold_bank,b.platinum_bank=c.platinum_bank WHERE b.id="+actor);
+   // Earned carried coins return with the player.
    auto wallet=Q(db,"SELECT b.copper+c.copper,b.silver+c.silver,b.gold+c.gold,b.platinum+c.platinum FROM shroud_original_character_currency b JOIN character_currency c ON c.id=b.id WHERE b.id="+actor+" FOR UPDATE");
    if(wallet.RowCount()!=1)throw std::runtime_error("shroud wallet snapshot missing");for(unsigned c=0;c<4;++c)if(N(wallet.begin()[c])>INT32_MAX)throw std::runtime_error("shroud wallet overflow");
    Q(db,"UPDATE shroud_original_character_currency b JOIN character_currency c ON c.id=b.id SET b.copper=b.copper+c.copper,b.silver=b.silver+c.silver,b.gold=b.gold+c.gold,b.platinum=b.platinum+c.platinum WHERE b.id="+actor);
@@ -462,8 +635,16 @@ void Client::ChangeSpiritShroud(uint32_t id) {
    std::string assignments;for(auto& f:Strings::Split(fields,',')){if(!assignments.empty())assignments+=",";assignments+="c.`"+f+"`=b.`"+f+"`";}
    auto original=Q(db,"SELECT id FROM shroud_original_character_data WHERE id="+actor+" FOR UPDATE");if(original.RowCount()!=1)throw std::runtime_error("shroud original profile missing");
    Q(db,"UPDATE character_data c JOIN shroud_original_character_data b ON c.id=b.id SET "+assignments+" WHERE c.id="+actor);
+   if(m_spirit_shroud_session_id){
+    auto level=Q(db,"SELECT level FROM character_data WHERE id="+actor);if(level.RowCount()!=1 || N(level.begin()[0])>255)throw std::runtime_error("shroud restored level invalid");
+    for(auto fee:Q(db,"SELECT merc_id,template_id FROM spirit_shroud_mercenary_fees WHERE character_id="+actor+" AND session_id="+S(m_spirit_shroud_session_id)+" AND paid_at IS NULL FOR UPDATE")){
+     if(!zone->GetMercTemplate(uint32_t(N(fee[1]))))continue; // Preserve the recorded liability if content is temporarily unavailable.
+     const auto cost=RuleB(Mercs,ChargeMercPurchaseCost)?uint64_t(Merc::CalcPurchaseCost(uint32_t(N(fee[1])),uint8_t(N(level.begin()[0]))))*100:0;
+     Q(db,"UPDATE spirit_shroud_mercenary_fees SET original_level="+S(N(level.begin()[0]))+",fee_copper="+S(cost)+" WHERE merc_id="+S(N(fee[0]))+" AND character_id="+actor+" AND paid_at IS NULL");
+    }
+   }
    for(auto table:Tables){std::string name=table.name,key=table.key;auto where=" WHERE "+key+"="+actor;
-    if(name!="character_data"){Q(db,"DELETE FROM "+name+where);Q(db,"INSERT INTO "+name+" SELECT * FROM shroud_original_"+name+where);}
+    if(name!="character_data"){Q(db,"DELETE FROM "+name+where+(name=="inventory"?carried:std::string()));Q(db,"INSERT INTO "+name+" SELECT * FROM shroud_original_"+name+where);}
     Q(db,"DELETE FROM shroud_original_"+name+where);
    }
    if(m_spirit_shroud_session_id){
@@ -472,12 +653,82 @@ void Client::ChangeSpiritShroud(uint32_t id) {
    }
    Q(db,"UPDATE spirit_shroud_state SET template_id=0,active_session_id=NULL,revision=revision+1 WHERE character_id="+actor);
   }
+  // Raid class/level are independent persisted/cache fields. Change them in
+  // the profile transaction for both native and reload transitions; retain
+  // every membership, group, leadership and loot-role column verbatim.
+  auto raid_rows=Q(db,"SELECT raidid,name FROM raid_members WHERE charid="+actor+" AND bot_id=0 FOR UPDATE");
+  auto* current_raid=GetRaid();
+  if(raid_rows.RowCount()>1 || bool(raid_rows.RowCount())!=bool(current_raid))throw std::runtime_error("shroud raid membership changed");
+  if(current_raid){
+   auto engine=Q(db,"SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='raid_members'");
+   if(engine.RowCount()!=1 || !engine.begin()[0] || std::string(engine.begin()[0])!="InnoDB")throw std::runtime_error("shroud raid storage must be transactional");
+   if(N(raid_rows.begin()[0])!=current_raid->GetID() || !raid_rows.begin()[1] || std::string(raid_rows.begin()[1])!=GetName() || !current_raid->IsRaidMember(this))throw std::runtime_error("shroud raid identity changed");
+   auto profile=Q(db,"SELECT class,level FROM character_data WHERE id="+actor);
+   if(profile.RowCount()!=1 || N(profile.begin()[0])<1 || N(profile.begin()[0])>16 || N(profile.begin()[1])<1 || N(profile.begin()[1])>126)throw std::runtime_error("shroud raid destination profile invalid");
+   raid_profile_id=current_raid->GetID();raid_profile_class=N(profile.begin()[0]);raid_profile_level=N(profile.begin()[1]);
+   Q(db,"UPDATE raid_members r JOIN character_data c ON c.id=r.charid SET r._class=c.class,r.level=c.level WHERE r.raidid="+S(raid_profile_id)+" AND r.charid="+actor+" AND r.bot_id=0 AND r.name='"+db.Escape(GetName())+"'");
+  }
+  // Prepare complete destination caches and all wire bytes while rollback is
+  // still possible. Unsupported state deliberately selects the proven reload
+  // route; no partially serialized native packet is ever sent after commit.
+  auto destination=RuleB(Character,NativeSpiritShroudTransitions)?PrepareSpiritShroudDestination(db):nullptr;
   auto identity=Q(db,"SELECT CONNECTION_ID(),@@in_transaction");if(N(identity.begin()[0])!=connection||N(identity.begin()[1])!=1)throw std::runtime_error("shroud connection changed");
   m_spirit_shroud_transition=true;committing=true;auto result=db.QueryDatabase(std::string("COMMIT"),false);
   if(!result.Success()){Disconnect();return;}started=false;
-  // A genuine same-zone transfer reconstructs every server/client profile cache
-  // using the committed rows. The old Client is write-fenced until deletion.
+  // The checkpoint persisted a regular pet before its rows entered escrow.
+  // Detach the old actor only after commit, without saving its stale owner
+  // cache back over the destination. Original saved pets return via the full
+  // reload fallback until their native actor bundle is supported.
+  if(auto* pet=GetPet()){
+   if(!pet->IsNPC() || pet->IsCharmed())throw std::runtime_error("shroud committed pet actor changed");
+   pet->SetOwnerID(0);SetPetID(0);pet->CastToNPC()->Depop(false);
+  }
+  m_petinfo={};m_suspendedminion={};
   m_spirit_shroud_keeper=0;m_spirit_shroud_menu_until=0;
+  if(destination){
+   if(!InstallSpiritShroudDestination(*destination))throw std::runtime_error("shroud committed cache installation failed");
+   BeginSpiritShroudNativeAcknowledgement(destination->revision);
+   SendAlternateAdvancementTable();
+   Send(*this,OP_SpiritShroudTransform,destination->self_bytes);
+   SendAlternateAdvancementPoints();SendAlternateAdvancementStats();SendAlternateAdvancementTimers();
+   // The compact profile uses only the proved empty-affect representation.
+   // Rebuild supported active affects with caster, duration, hit count and
+   // cast coordinates. Counter/rune bookkeeping uses the reload fallback.
+   for(int slot=0;slot<GetMaxTotalSlots();++slot)
+    if(IsValidSpell(buffs[slot].spellid))SendBuffDurationPacket(buffs[slot],slot,true);
+   auto* icons=MakeBuffsPacket(false);FastQueuePacket(&icons);
+   EQApplicationPacket targets(OP_XTargetResponse,8);
+   targets.WriteUInt32(GetMaxXTargets());targets.WriteUInt32(0);QueuePacket(&targets);
+   SendXTargetUpdates();
+   const auto lower=GetEXPForLevel(GetLevel()),upper=GetEXPForLevel(GetLevel()+1);
+   if(lower!=UINT32_MAX && upper!=UINT32_MAX && upper>lower){
+    const auto ratio=std::clamp((double(GetEXP())-lower)/double(upper-lower),0.0,1.0);
+    EQApplicationPacket xp(OP_ExpUpdate,sizeof(ExpUpdate_Struct));
+    reinterpret_cast<ExpUpdate_Struct*>(xp.pBuffer)->exp=uint32_t(330.0*ratio);QueuePacket(&xp);
+   }
+   RemoveAllNimbusEffects();
+   EQApplicationPacket observer(OP_SpiritShroudTransform,destination->observer_bytes.size());
+   std::copy(destination->observer_bytes.begin(),destination->observer_bytes.end(),observer.pBuffer);
+   entity_list.QueueClients(this,&observer,true);
+   for(int slot=0;slot<GetMaxTotalSlots();++slot)if(IsValidSpell(buffs[slot].spellid)){
+    const auto nimbus=GetSpellNimbusEffect(buffs[slot].spellid);
+    if(nimbus && !IsNimbusEffectActive(nimbus))SendSpellEffect(nimbus,500,0,1,3000,true);
+   }
+   if(auto* group=GetGroup()){group->UpdatePlayer(this);group->SendHPManaEndPacketsTo(this);}
+   if(raid_profile_id){
+    auto* raid=GetRaid();
+    if(!raid || raid->GetID()!=raid_profile_id || !raid->RefreshMemberProfile(this,raid_profile_class,raid_profile_level))throw std::runtime_error("shroud raid profile publication failed");
+    raid->SendHPManaEndPacketsFrom(this);raid->SendHPManaEndPacketsTo(this);
+   }
+   LogInfo("Spirit Shroud native transition queued for character [{}], revision [{}], template [{}]",CharacterID(),m_spirit_shroud_revision,m_spirit_shroud_template);
+   return;
+  }
+  // Fallback reconstructs every cache from committed rows. The old Client is
+  // kept write-fenced until deletion, exactly as in the previous implementation.
+  if(raid_profile_id){
+   auto* raid=GetRaid();
+   if(!raid || raid->GetID()!=raid_profile_id || !raid->RefreshMemberProfile(this,raid_profile_class,raid_profile_level))throw std::runtime_error("shroud raid reload publication failed");
+  }
   MovePC(zone->GetZoneID(),zone->GetInstanceID(),GetX(),GetY(),GetZ(),GetHeading(),1,EvacToSafeCoords);
  }catch(const std::exception& error){
   LogError("Spirit Shroud transition failed: [{}]",error.what());
@@ -557,10 +808,17 @@ void Client::Handle_OP_SpiritShroudBank(const EQApplicationPacket* p) {
    if(item)SendItemPacket(EQ::invslot::slotCursor,item.get(),ItemPacketViewLink);
   }catch(...){}return;
  }
- if(action!=2||p->size!=16||Now()>m_spirit_shroud_menu_until||!Keeper(*this,m_spirit_shroud_keeper))return;
- uint64_t key=Read32(p->pBuffer+8)|(uint64_t(Read32(p->pBuffer+12))<<32);if(!key||key>9000)return;
- auto old=int16_t(key-1);if(old>=EQ::invslot::slotCursor)return;
- int16_t free=GetInv().FindFreeSlot(true,false);if(free<EQ::invslot::GENERAL_BEGIN||free>EQ::invslot::GENERAL_END){Message(Chat::Yellow,"Make room in your main inventory first.");return;}
+ if(action!=2||p->size!=16)return;
+ const auto decline=[this]() {
+  // The proven all-ones key leaves rows intact while completing one pending
+  // Get request (0x61dad9 -> 0x61db47). Do not strand the native wait counter.
+  Bytes response;Put32(response,2);Put32(response,0);Put64(response,std::numeric_limits<uint64_t>::max());
+  Send(*this,OP_SpiritShroudBank,response);
+ };
+ if(Now()>m_spirit_shroud_menu_until||!Keeper(*this,m_spirit_shroud_keeper)){decline();return;}
+ uint64_t key=Read32(p->pBuffer+8)|(uint64_t(Read32(p->pBuffer+12))<<32);if(!key||key>9000){decline();return;}
+ auto old=int16_t(key-1);if(old>=EQ::invslot::slotCursor){decline();return;}
+ int16_t free=GetInv().FindFreeSlot(true,false);if(free<EQ::invslot::GENERAL_BEGIN||free>EQ::invslot::GENERAL_END){Message(Chat::Yellow,"Make room in your main inventory first.");decline();return;}
  Database db;auto* cfg=EQEmuConfig::get();bool started=false,committing=false;
  try{
   if(!cfg||!db.Connect(cfg->DatabaseHost,cfg->DatabaseUsername,cfg->DatabasePassword,cfg->DatabaseDB,cfg->DatabasePort,"shroud-bank"))throw std::runtime_error("bank connect");
@@ -576,24 +834,97 @@ void Client::Handle_OP_SpiritShroudBank(const EQApplicationPacket* p) {
    Q(db,"INSERT INTO inventory ("+cols+") SELECT "+values+" FROM spirit_shroud_bank_inventory WHERE character_id="+actor+" AND slot_id="+S(pair.first));
    Q(db,"DELETE FROM spirit_shroud_bank_inventory WHERE character_id="+actor+" AND slot_id="+S(pair.first));
   }
+  // Stage the exact committed destination tree and normal item wire before
+  // crossing COMMIT. Unsupported legacy state retains full reload recovery.
+  std::unique_ptr<EQ::ItemInstance> prepared_item;
+  std::optional<Bytes> prepared_wire;
+  uint16_t item_opcode=0;
+  if(ClientVersion()==EQ::versions::ClientVersion::RoF2 && eqs && eqs->GetOpcodeManager()) {
+   item_opcode=eqs->GetOpcodeManager()->EmuToEQ(OP_ItemPacket);
+   auto snapshot=InventoryRepository::GetLoadSnapshot(db,CharacterID(),true);
+   if(snapshot.success && item_opcode) {
+    const auto row_from=[](const InventoryRepository::LoadRow& load) {
+     Housing::LiveItems::InventoryRow row;row.values=load.values;
+     if(!load.fields[2])row.null_fields|=Housing::LiveItems::NullItemId;
+     if(!load.fields[3])row.null_fields|=Housing::LiveItems::NullCharges;
+     if(!load.fields[12])row.null_fields|=Housing::LiveItems::NullCustomData;
+     if(!load.fields[16])row.null_fields|=Housing::LiveItems::NullGuid;
+     return row;
+    };
+    const InventoryRepository::LoadRow* root_row=nullptr;
+    for(const auto& load:snapshot.rows)if(load.values.slot_id==uint32_t(free))root_row=&load;
+    if(root_row) {
+     auto destination=row_from(*root_row);
+     for(const auto& load:snapshot.rows)if(load.values.slot_id!=uint32_t(free) && EQ::InventoryProfile::CalcSlotId(load.values.slot_id)==free) {
+      auto child=row_from(load);child.values.slot_id=EQ::InventoryProfile::CalcBagIdx(load.values.slot_id);destination.children.push_back(std::move(child));
+     }
+     auto rebuilt=Housing::InventoryBridge::ReconstructCharacterProfile(database,destination);
+     if(rebuilt) {
+      prepared_item=std::move(rebuilt.value.item);
+      prepared_wire=RoF2::SerializeShroudBankItem(*prepared_item,free);
+      if(!prepared_wire)prepared_item.reset();
+     }
+    }
+   }
+  }
+  if(prepared_item) {
+   // Runtime serials are ephemeral handles, not item custody identity. Persist
+   // this exact newly reconstructed tree's handles in the same owned transaction
+   // so ordinary inventory saves/lease checks see the same projection.
+   Q(db,"UPDATE inventory SET guid="+S(prepared_item->GetSerialNumber())+" WHERE character_id="+actor+" AND slot_id="+S(free));
+   for(unsigned i=0;i<EQ::invbag::SLOT_COUNT;++i)if(const auto* child=prepared_item->GetItem(i))
+    Q(db,"UPDATE inventory SET guid="+S(child->GetSerialNumber())+" WHERE character_id="+actor+" AND slot_id="+S(EQ::InventoryProfile::CalcSlotId(free,i)));
+  }
   auto identity=Q(db,"SELECT CONNECTION_ID(),@@in_transaction");if(N(identity.begin()[0])!=connection||N(identity.begin()[1])!=1)throw std::runtime_error("bank connection changed");
   m_spirit_shroud_transition=true;committing=true;auto commit=db.QueryDatabase(std::string("COMMIT"),false);if(!commit.Success()){Disconnect();return;}started=false;
-  MovePC(zone->GetZoneID(),zone->GetInstanceID(),GetX(),GetY(),GetZ(),GetHeading(),1,EvacToSafeCoords);
- }catch(...){if(started&&db.GetStatus()==DBcore::Connected)db.QueryDatabase(std::string("ROLLBACK"),false);if(committing){m_spirit_shroud_transition=true;Disconnect();}else Message(Chat::Red,"The item remains in your shroud bank.");}
+  if(!prepared_item) {
+   LogInfo("Shroud bank retrieval reload fallback character [{}]",CharacterID());
+   MovePC(zone->GetZoneID(),zone->GetInstanceID(),GetX(),GetY(),GetZ(),GetHeading(),1,EvacToSafeCoords);return;
+  }
+  if(!eqs || GetInv().GetItem(free))throw std::runtime_error("bank destination cache changed");
+  auto* installed=prepared_item.get();
+  if(m_inv.PushItem(free,installed)!=free)throw std::runtime_error("bank destination cache install failed");
+  prepared_item.release();
+  EQApplicationPacket item_packet(OP_Unknown,prepared_wire->size());
+  std::copy(prepared_wire->begin(),prepared_wire->end(),item_packet.pBuffer);item_packet.SetOpcodeBypass(item_opcode);QueuePacket(&item_packet);
+  // Matching RoF2 0x61dacb consumes action2, reserved DWORD, and original
+  // uint64 bank key: remove that row and decrement pending retrieval count.
+  Bytes acknowledgement;Put32(acknowledgement,2);Put32(acknowledgement,0);Put64(acknowledgement,key);
+  Send(*this,OP_SpiritShroudBank,acknowledgement);
+  m_spirit_shroud_transition=false;
+  CalcBonuses(); // Same post-inventory refresh as ordinary item admission.
+  LogInfo("Native shroud bank retrieval completed character [{}]",CharacterID());
+ }catch(...){if(started&&db.GetStatus()==DBcore::Connected)db.QueryDatabase(std::string("ROLLBACK"),false);if(committing){m_spirit_shroud_transition=true;Disconnect();}else {Message(Chat::Red,"The item remains in your shroud bank.");decline();}}
 }
 
 
 bool Client::HasSpiritShroudRank(uint32_t rank) const {return IsSpiritShrouded() && m_spirit_shroud_aa_ranks.count(rank);}
 void Client::SendSpiritShroudProgress() {
  if(!RuleB(Character,EnableSpiritShrouds)||m_spirit_shroud_transition)return;
- try {std::map<uint32_t,Template> progressions;std::map<uint32_t,std::set<uint32_t>> branches,unlocked;
-  for(auto& t:Catalog(database)){progressions.emplace(t.progression,t);branches[t.progression].insert(t.branch);if(Progress(database,CharacterID(),t.progression)>=t.unlock_xp)unlocked[t.progression].insert(t.branch);}
-  Bytes out;Put32(out,progressions.size());std::string text;
-  for(auto& entry:progressions){auto& t=entry.second;auto xp=Progress(database,CharacterID(),t.progression);
-   text+=Token("PROGRESSION",'\a')+Token(S(t.progression),'\a')+Token(t.progression_name,'\a')+Token("Spirit experience: "+S(xp),'\a')+Token(S(unlocked[t.progression].size()),'\a')+Token(S(branches[t.progression].size()),'\a')+Token("",'\a')+Token("",'\a')+Token(S(std::min<uint64_t>(100,xp/1000)),'\a');}
+ try {
+  auto families=Q(database,"SELECT progression_id,name,completion_xp,branch_count,definition_version FROM spirit_shroud_progression_definitions ORDER BY progression_id");
+  if(families.RowCount()>64)throw std::runtime_error("invalid shroud progression family count");
+  Bytes out;Put32(out,families.RowCount());std::string text;
+  for(auto row:families){
+   const auto family=N(row[0]),count=N(row[3]),version=N(row[4]);
+   if(!family||!row[1]||!count||count>64||!version)throw std::runtime_error("invalid shroud progression definition");
+   const auto xp=Progress(database,CharacterID(),family);
+   auto branches=Q(database,"SELECT branch_id,unlock_xp FROM spirit_shroud_branch_progression WHERE progression_id="+S(family)+" AND definition_version="+S(version)+" ORDER BY branch_id");
+   if(branches.RowCount()!=count)throw std::runtime_error("incomplete shroud progression definition");
+   uint64_t unlocked=0;for(auto branch:branches)if(branch[1]&&xp>=N(branch[1]))++unlocked;
+   uint64_t percentage=0;
+   std::string detail="Spirit experience: "+S(xp);
+   if(row[2]&&N(row[2])){
+    const auto target=N(row[2]);
+    percentage=xp>=target?100:static_cast<uint64_t>(100.0L*xp/target);
+    detail+=" / "+S(target);
+   }else detail+=" (completion threshold unmeasured)";
+   text+=Token("PROGRESSION",'\a')+Token(S(family),'\a')+Token(row[1],'\a')+Token(detail,'\a')+Token(S(unlocked),'\a')+Token(S(count),'\a')+Token("",'\a')+Token("",'\a')+Token(S(percentage),'\a');
+  }
   Text(out,text);Send(*this,OP_SpiritShroudProgressReplace,out);m_spirit_shroud_progress_sent=Now();
- }catch(...){}
+ }catch(const std::exception& error){LogError("Spirit Shroud progress display unavailable: [{}]",error.what());}
 }
+
 void Client::PurchaseSpiritShroudRank(uint32_t rank_id, bool saved_set)
 {
  if(!IsSpiritShrouded() || !m_spirit_shroud_session_id || !m_spirit_shroud_definition ||
@@ -741,4 +1072,139 @@ std::optional<uint32_t> Client::SpiritShroudAbilityMinimumLevel(uint16_t spell_i
  const auto* rank=zone->GetAlternateAdvancementRank(rank_id);
  return SpiritShroud::AbilityMinimumLevel(SpiritShroudDefinition(),rank,spell_id,
   GetAA(rank_id),GetClass(),GetLevel(),m_spirit_shroud_transition);
+}
+
+namespace {
+void ShroudDeathSchema(Database& db)
+{
+ auto engines=Q(db,"SELECT TABLE_NAME,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ('character_corpses','spirit_shroud_corpse_state')");
+ if(engines.RowCount()!=2)throw std::runtime_error("shroud corpse storage missing");
+ for(auto r:engines)if(!r[1]||std::string(r[1])!="InnoDB")throw std::runtime_error("shroud corpse storage must be transactional");
+ auto fields=Q(db,"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='spirit_shroud_corpse_state' AND COLUMN_NAME IN ('provenance_version','created_at','rez_claimed_at','rez_spell_id')");
+ if(N(fields.begin()[0])!=4)throw std::runtime_error("shroud corpse migration missing");
+}
+std::string ShroudCorpseEventKey(uint64_t session,uint32_t corpse,unsigned kind)
+{
+ return "UNHEX(CONCAT(LPAD(HEX("+S(session)+"),16,'0'),LPAD(HEX("+S(corpse)+"),8,'0'),LPAD(HEX("+S(kind)+"),8,'0')))";
+}
+}
+
+bool Client::RecordSpiritShroudDeath(uint32_t corpse_id,uint64_t requested_loss,uint64_t& applied_loss)
+{
+ applied_loss=0;
+ if(!IsSpiritShrouded()||!m_spirit_shroud_session_id||!corpse_id||m_spirit_shroud_transition||m_inventory_session_rejected)return false;
+ Database db;auto* cfg=EQEmuConfig::get();bool started=false,committing=false;
+ try {
+  if(!cfg||!db.Connect(cfg->DatabaseHost,cfg->DatabaseUsername,cfg->DatabasePassword,cfg->DatabaseDB,cfg->DatabasePort,"shroud-death"))throw std::runtime_error("shroud death connection");
+  Schema(db);ShroudDeathSchema(db);Q(db,"START TRANSACTION");started=true;
+  const auto connection=N(Q(db,"SELECT CONNECTION_ID()").begin()[0]);LockActor(db,*this);
+  const auto actor=S(CharacterID()),session=S(m_spirit_shroud_session_id),corpse=S(corpse_id);
+  auto state=Q(db,"SELECT s.template_id,s.revision,s.active_session_id,p.phase FROM spirit_shroud_state s JOIN spirit_shroud_sessions p ON p.id=s.active_session_id AND p.character_id=s.character_id WHERE s.character_id="+actor+" FOR UPDATE");
+  if(state.RowCount()!=1||N(state.begin()[0])!=m_spirit_shroud_template||N(state.begin()[1])!=m_spirit_shroud_revision||N(state.begin()[2])!=m_spirit_shroud_session_id||!state.begin()[3]||std::string(state.begin()[3])!="active")throw std::runtime_error("shroud death session changed");
+  auto body=Q(db,"SELECT charid,exp,is_rezzed FROM character_corpses WHERE id="+corpse+" FOR UPDATE");
+  if(body.RowCount()!=1||N(body.begin()[0])!=CharacterID())throw std::runtime_error("shroud death corpse missing or foreign");
+  auto old=Q(db,"SELECT character_id,session_id,applied_loss,provenance_version FROM spirit_shroud_corpse_state WHERE corpse_id="+corpse+" FOR UPDATE");
+  if(old.RowCount()){
+   if(N(old.begin()[0])!=CharacterID()||N(old.begin()[1])!=m_spirit_shroud_session_id||N(old.begin()[3])!=1)throw std::runtime_error("shroud death provenance changed");
+   applied_loss=N(old.begin()[2]);Q(db,"ROLLBACK");return true;
+  }
+  if(N(body.begin()[1])||N(body.begin()[2]))throw std::runtime_error("shroud death corpse already has experience");
+  auto rows=Q(db,"SELECT "+std::string(ExperienceColumns)+" FROM spirit_shroud_experience_state WHERE session_id="+session+" AND settled_at IS NULL FOR UPDATE");
+  if(rows.RowCount()!=1)throw std::runtime_error("shroud death pending experience missing");
+  auto pending=ReadExperience(rows.begin());
+  // Use the server's existing active-form death formula and configured level
+  // floor. This is documented emulator policy; no Live multiplier is invented.
+  applied_loss=SpiritShroud::ApplyDeathLoss(pending,std::min<uint64_t>(requested_loss,INT32_MAX),RuleB(Character,DeathKeepLevel));
+  Q(db,"UPDATE spirit_shroud_experience_state SET normal_exp="+S(pending.normal)+",level="+S(pending.level)+" WHERE session_id="+session+" AND settled_at IS NULL");
+  Q(db,"INSERT INTO spirit_shroud_corpse_state(corpse_id,character_id,session_id,applied_loss,refunded_loss,provenance_version,created_at) VALUES("+corpse+","+actor+","+session+","+S(applied_loss)+",0,1,"+S(Now())+")");
+  Q(db,"UPDATE character_corpses SET entity_variables=JSON_OBJECT('spirit_shroud_corpse','1'),exp="+S(applied_loss)+",is_rezzed=0 WHERE id="+corpse+" AND charid="+actor);
+  Q(db,"INSERT INTO spirit_shroud_experience_events(session_id,event_key,source,progression_delta,normal_delta,aa_delta,created_at) VALUES("+session+","+ShroudCorpseEventKey(m_spirit_shroud_session_id,corpse_id,1)+","+S(static_cast<uint32_t>(ExpSource::Death))+",0,-"+S(applied_loss)+",0,"+S(Now())+")");
+  auto check=Q(db,"SELECT CONNECTION_ID(),@@in_transaction");if(N(check.begin()[0])!=connection||N(check.begin()[1])!=1)throw std::runtime_error("shroud death connection changed");
+  committing=true;auto result=db.QueryDatabase(std::string("COMMIT"),false);
+  if(!result.Success()){m_spirit_shroud_transition=true;Disconnect();return false;}started=false;
+  return true;
+ }catch(const std::exception& error){
+  if(started&&db.GetStatus()==DBcore::Connected)db.QueryDatabase(std::string("ROLLBACK"),false);
+  LogError("Spirit Shroud death accounting rejected for character [{}], corpse [{}]: [{}]",CharacterID(),corpse_id,error.what());
+  if(committing)m_spirit_shroud_transition=true;
+  Message(Chat::Red,"Your shroud death could not be saved. Reconnect before continuing.");Disconnect();return false;
+ }
+}
+
+bool Client::CanAcceptSpiritShroudResurrection(uint32_t corpse_id)
+{
+ if(!IsSpiritShrouded())return true;
+ if(!corpse_id||m_spirit_shroud_transition||m_inventory_session_rejected)return false;
+ auto r=database.QueryDatabase("SELECT p.corpse_id FROM spirit_shroud_corpse_state p JOIN character_corpses c ON c.id=p.corpse_id AND c.charid=p.character_id WHERE p.corpse_id="+S(corpse_id)+" AND p.character_id="+S(CharacterID())+" AND p.provenance_version=1");
+ return r.Success()&&r.RowCount()==1;
+}
+
+bool Client::SettleSpiritShroudResurrection(uint32_t corpse_id,uint32_t spell_id,uint64_t offered_loss,bool& handled)
+{
+ handled=false;
+ // A normal corpse keeps its existing path. Missing optional storage is also
+ // harmless to ordinary characters when Spirit Shrouds have never been enabled.
+ auto known=database.QueryDatabase("SELECT provenance_version FROM spirit_shroud_corpse_state WHERE corpse_id="+S(corpse_id));
+ if(!known.Success())return !IsSpiritShrouded()&&!RuleB(Character,EnableSpiritShrouds);
+ if(!known.RowCount())return !IsSpiritShrouded();
+ handled=true;
+ if(N(known.begin()[0])!=1||!corpse_id||m_spirit_shroud_transition||m_inventory_session_rejected||
+    PendingRezzXP<0||PendingRezzDBID!=corpse_id||PendingRezzSpellID!=spell_id||!IsValidSpell(spell_id))return false;
+ int percent=-1;
+ for(int slot=0;slot<EFFECT_COUNT;++slot)if(spells[spell_id].effect_id[slot]==SpellEffect::Revive){percent=spells[spell_id].base_value[slot];break;}
+ if(percent<0||percent>100)return false;
+ Database db;auto* cfg=EQEmuConfig::get();bool started=false,committing=false,normal_profile=false;SpiritShroud::ExperienceState credited;
+ try {
+  if(!cfg||!db.Connect(cfg->DatabaseHost,cfg->DatabaseUsername,cfg->DatabasePassword,cfg->DatabaseDB,cfg->DatabasePort,"shroud-resurrection"))throw std::runtime_error("shroud resurrection connection");
+  Schema(db);ShroudDeathSchema(db);Q(db,"START TRANSACTION");started=true;
+  const auto connection=N(Q(db,"SELECT CONNECTION_ID()").begin()[0]);LockActor(db,*this);const auto actor=S(CharacterID()),corpse=S(corpse_id);
+  auto state=Q(db,"SELECT template_id,revision,active_session_id FROM spirit_shroud_state WHERE character_id="+actor+" FOR UPDATE");
+  if(state.RowCount()!=1)throw std::runtime_error("shroud resurrection state missing");
+  if(IsSpiritShrouded()){
+   if(N(state.begin()[0])!=m_spirit_shroud_template||N(state.begin()[1])!=m_spirit_shroud_revision||!state.begin()[2]||N(state.begin()[2])!=m_spirit_shroud_session_id)throw std::runtime_error("shroud resurrection session changed");
+  }else if(N(state.begin()[0])||state.begin()[2])throw std::runtime_error("shroud resurrection original profile not active");
+  auto provenance=Q(db,"SELECT p.character_id,p.session_id,p.applied_loss,p.refunded_loss,p.provenance_version,p.rez_claimed_at,s.phase FROM spirit_shroud_corpse_state p JOIN spirit_shroud_sessions s ON s.id=p.session_id AND s.character_id=p.character_id WHERE p.corpse_id="+corpse+" FOR UPDATE");
+  if(provenance.RowCount()!=1||N(provenance.begin()[0])!=CharacterID()||N(provenance.begin()[4])!=1)throw std::runtime_error("shroud resurrection provenance missing or foreign");
+  const auto source_session=N(provenance.begin()[1]),applied=N(provenance.begin()[2]);
+  if(applied>INT32_MAX||N(provenance.begin()[3])>applied)throw std::runtime_error("shroud resurrection invalid debit");
+  if(!provenance.begin()[6]||(std::string(provenance.begin()[6])!="restored"&&!(IsSpiritShrouded()&&source_session==m_spirit_shroud_session_id&&std::string(provenance.begin()[6])=="active")))throw std::runtime_error("shroud resurrection source session unresolved");
+  auto body=Q(db,"SELECT charid,exp,is_rezzed,rezzable FROM character_corpses WHERE id="+corpse+" FOR UPDATE");
+  if(body.RowCount()!=1||N(body.begin()[0])!=CharacterID())throw std::runtime_error("shroud resurrection corpse missing or foreign");
+  // Repeated acceptance and zero-XP corpse gates cannot credit the debit twice.
+  if(provenance.begin()[5]){Q(db,"ROLLBACK");return true;}
+  if(N(body.begin()[2])||!N(body.begin()[3])||N(body.begin()[1])!=applied||offered_loss!=applied)throw std::runtime_error("shroud resurrection offer changed or expired");
+  uint64_t destination_session=source_session;
+  if(IsSpiritShrouded()){
+   destination_session=m_spirit_shroud_session_id;
+   auto pending=Q(db,"SELECT "+std::string(ExperienceColumns)+" FROM spirit_shroud_experience_state WHERE session_id="+S(destination_session)+" AND settled_at IS NULL FOR UPDATE");
+   if(pending.RowCount()!=1)throw std::runtime_error("shroud resurrection pending experience missing");credited=ReadExperience(pending.begin());
+  }else{
+   normal_profile=true;credited.normal=GetEXP();credited.aa=GetAAXP();credited.aa_points=GetAAPoints();credited.aa_spent=GetSpentAA();
+   credited.level=GetLevel();credited.level2=m_pp.level2;credited.skill_points=m_pp.points;credited.percent_to_aa=GetLevel()>50?std::min<uint32_t>(100,GetAAPercent()):0;credited.aa_unit=GetRequiredAAExperience();
+   auto maximum=RuleI(Character,MaxExpLevel);if(maximum<1)maximum=RuleI(Character,MaxLevel);if(GetClientMaxLevel())maximum=GetClientMaxLevel();credited.max_level=std::max<int>(GetLevel(),maximum);
+   if(!credited.max_level||credited.max_level>126)throw std::runtime_error("shroud resurrection level cap invalid");credited.thresholds.push_back(0);
+   for(uint32_t i=1;i<=credited.max_level+1;++i)credited.thresholds.push_back(GetEXPForLevel(i));
+  }
+  const auto refund=SpiritShroud::ApplyResurrection(credited,applied,uint32_t(percent),RuleI(AA,UnusedAAPointCap));
+  if(normal_profile)Q(db,"UPDATE character_data SET exp="+S(credited.normal)+",level="+S(credited.level)+",level2="+S(credited.level2)+",points="+S(credited.skill_points)+" WHERE id="+actor);
+  else Q(db,"UPDATE spirit_shroud_experience_state SET normal_exp="+S(credited.normal)+",level="+S(credited.level)+",level2="+S(credited.level2)+",skill_points="+S(credited.skill_points)+" WHERE session_id="+S(destination_session)+" AND settled_at IS NULL");
+  auto claim=Q(db,"UPDATE spirit_shroud_corpse_state SET refunded_loss="+S(refund)+",rez_claimed_at="+S(Now())+",rez_spell_id="+S(spell_id)+" WHERE corpse_id="+corpse+" AND rez_claimed_at IS NULL");if(claim.RowsAffected()!=1)throw std::runtime_error("shroud resurrection already claimed");
+  Q(db,"UPDATE character_corpses SET exp=0,is_rezzed=1 WHERE id="+corpse+" AND charid="+actor);
+  Q(db,"INSERT INTO spirit_shroud_experience_events(session_id,event_key,source,progression_delta,normal_delta,aa_delta,created_at,settled_at) VALUES("+S(destination_session)+","+ShroudCorpseEventKey(destination_session,corpse_id,2)+","+S(static_cast<uint32_t>(ExpSource::Resurrection))+",0,"+S(refund)+",0,"+S(Now())+","+(normal_profile?S(Now()):"NULL")+")");
+  auto check=Q(db,"SELECT CONNECTION_ID(),@@in_transaction");if(N(check.begin()[0])!=connection||N(check.begin()[1])!=1)throw std::runtime_error("shroud resurrection connection changed");
+  committing=true;auto result=db.QueryDatabase(std::string("COMMIT"),false);if(!result.Success()){m_spirit_shroud_transition=true;Disconnect();return false;}started=false;
+  if(normal_profile){
+   m_pp.exp=static_cast<uint32_t>(credited.normal);
+   if(GetLevel()!=credited.level)SetLevel(static_cast<uint8_t>(credited.level),false);
+   auto* update=new EQApplicationPacket(OP_ExpUpdate,sizeof(ExpUpdate_Struct));auto* value=reinterpret_cast<ExpUpdate_Struct*>(update->pBuffer);
+   const auto bottom=GetEXPForLevel(GetLevel()),top=GetEXPForLevel(GetLevel()+1);
+   value->exp=top>bottom?static_cast<uint32_t>(330.0*std::min<uint64_t>(top-bottom,m_pp.exp>=bottom?m_pp.exp-bottom:0)/(top-bottom)):0;QueuePacket(update);safe_delete(update);
+  }
+  return true;
+ }catch(const std::exception& error){
+  if(started&&db.GetStatus()==DBcore::Connected)db.QueryDatabase(std::string("ROLLBACK"),false);
+  LogError("Spirit Shroud resurrection rejected for character [{}], corpse [{}]: [{}]",CharacterID(),corpse_id,error.what());
+  if(committing){m_spirit_shroud_transition=true;Disconnect();}
+  Message(Chat::Red,"Your resurrection could not be settled. The corpse claim has not been acknowledged.");return false;
+ }
 }

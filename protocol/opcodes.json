@@ -50,6 +50,10 @@
       "opcode": "0x6562"
     },
     {
+      "name": "OP_SpiritShroudComplete",
+      "opcode": "0x7786"
+    },
+    {
       "name": "OP_SpiritShroudBank",
       "opcode": "0x7b71"
     },

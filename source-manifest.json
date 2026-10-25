@@ -4,8 +4,8 @@
   "housing_commit": "9aad4cc0857bdd14677dd45ab24f3eafe20d489b",
   "fellowship_commit": "9382453264f4f84ac7e83a9ee5c9c9a1391c6017",
   "mercenaries_commit": "00b07c381a738a21aff08867bf186e6c2bfaffb0",
-  "publication_date": "2026-10-24",
-  "scope": "Partial production Spirit Shroud source extension, observed modern Live content adapted to RoF2; excludes provisional starter catalog, tests, fixtures, helpers, raw research, client assets and private runtime data.",
+  "publication_date": "2026-10-25",
+  "scope": "Partial production Spirit Shroud source extension through migrations 013\u2013015 and optional native transitions; modern Live content adapted to RoF2. Excludes provisional starter catalog, tests, fixtures, research helpers, client assets and private runtime data.",
   "files": [
     {
       "path": ".gitattributes",
@@ -29,33 +29,33 @@
     },
     {
       "path": "README.md",
-      "bytes": 5682,
-      "sha256": "e97f43feb78a7ef2eb330140516c2de5b191b37d37857466ba08bbefeb7574fa"
+      "bytes": 7399,
+      "sha256": "35f0755322ac35f3d212ac44e0678de0e99bcb2d3a053e6a376bd9e1783c7ea2"
     },
     {
       "path": "docs/ARCHITECTURE.md",
-      "bytes": 5456,
-      "sha256": "c5f44ddac02fb77906389f859665cf869b375cef1d441bfce85306acabfdae99"
+      "bytes": 11415,
+      "sha256": "b1865aaf6d854e664cbaebbabf6248ea8182117b2bffa07c9110ba1f498c5a6d"
     },
     {
       "path": "docs/GAMEPLAY.md",
-      "bytes": 4223,
-      "sha256": "8d98bb72a89f7cc0896546d66736b3a554168a7ae9ef2e44f6d04d5005c7a926"
+      "bytes": 2908,
+      "sha256": "e99bbc203758d13fe70a55afb2fee8f20288435ee44ed3763c0565ce5a19c5ab"
     },
     {
       "path": "docs/INSTALL.md",
-      "bytes": 5107,
-      "sha256": "1bc8afb98d36dd2c8abd94acc7f1c3df5196981a3d488c7c99107cbd8be440aa"
+      "bytes": 6279,
+      "sha256": "c62cb2435aebc5425cf9976dfd9cfecb0f131cfbdd14fbc0d5c5b7a8cd743bf9"
     },
     {
       "path": "docs/KNOWN-GAPS.md",
-      "bytes": 5924,
-      "sha256": "61fe6040d6517fcfb8b6dcddedfdea07075621eaf1cbaa0be11d32122a01ddee"
+      "bytes": 7177,
+      "sha256": "9f4201ae8063fc49f9ffb1d665f7df4d7634fb915f4a5e8a82ee5965e8d2aa5c"
     },
     {
       "path": "docs/STATUS.md",
-      "bytes": 3879,
-      "sha256": "820a6a60483588f14b3de00c7766f5827dacc67bc821797fc6c689ffbb8dd227"
+      "bytes": 10122,
+      "sha256": "5081d27a4032c535909a0909291a8febf6449be907188263138454e28f3e71ca"
     },
     {
       "path": "overlay/common/shroud/aa_preview.h",
@@ -74,13 +74,23 @@
     },
     {
       "path": "overlay/common/shroud/experience.h",
-      "bytes": 2824,
-      "sha256": "f8ca2e1e9cd9c650a227303cd0629d6c1d934fe1618016741687cc64a6b4269b"
+      "bytes": 4447,
+      "sha256": "cd5780903aa73b9fc59a0c145d8c0da6fe119fd75ef37c6695bb7c1530a17eeb"
+    },
+    {
+      "path": "overlay/common/shroud/haste.h",
+      "bytes": 1471,
+      "sha256": "d6b9f4c7a67ec2e540541112b5b25482da49601f8c79b89c659cc9c3cc10145d"
     },
     {
       "path": "overlay/common/shroud/native_stats.h",
       "bytes": 1099,
       "sha256": "47252e57310b457eb132ff27ee7234f99791019d4d3c06755f074b148ed9b71d"
+    },
+    {
+      "path": "overlay/common/shroud/native_transform.h",
+      "bytes": 4188,
+      "sha256": "aacc0eec90101a8e45ae8b21207467f29d2aa7f03d322a87f4c6173862c717dc"
     },
     {
       "path": "overlay/common/shroud/resource_baseline.h",
@@ -148,9 +158,34 @@
       "sha256": "d1646741121e0b393efe6a292e61dee4aa64fce455934be2729b47609e47711e"
     },
     {
+      "path": "overlay/utils/sql/shroud/013_remaining_monster_aa.sql",
+      "bytes": 242631,
+      "sha256": "64319d68a76e10607e632d487e0a00185bf394152146e6cb8517095ac2901e4a"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/014_death_resurrection_accounting.sql",
+      "bytes": 2727,
+      "sha256": "b4b8b9698f82ead1709901a66965b03965acdc1b46a3e91505244c80e6666574"
+    },
+    {
+      "path": "overlay/utils/sql/shroud/015_system_interactions.sql",
+      "bytes": 1036,
+      "sha256": "6d97d2a0323ddc8b9ef81c5307b6807456264f8681933b9f210a1c74bca5c52a"
+    },
+    {
       "path": "overlay/zone/client_spirit_shroud.cpp",
-      "bytes": 61873,
-      "sha256": "01e00b7910073ba4c68c60f36c3e847c11e4c9cb0f0b161d86642181384a82a6"
+      "bytes": 97626,
+      "sha256": "3aa53b7734b1de8f8b3026cd0895da56658cb1a20d0f85f31a1c3b37c63aeafd"
+    },
+    {
+      "path": "overlay/zone/client_spirit_shroud_native.cpp",
+      "bytes": 28584,
+      "sha256": "3ddc522f38d78f28ca71a90d5e8aadd89f296803f60a61b7d841a152db4787ff"
+    },
+    {
+      "path": "overlay/zone/spirit_shroud_destination.h",
+      "bytes": 1027,
+      "sha256": "e42531ff2b5719ea1651889881ae6b7434259ef4c3bf2e518270c0c1131ad1ef"
     },
     {
       "path": "patches/base-manifest.json",
@@ -159,28 +194,28 @@
     },
     {
       "path": "patches/eqemu-spirit-shrouds.patch",
-      "bytes": 60064,
-      "sha256": "77a648bbd7e4aa1a34c8ccb72d24a26120ebfecb9424166ccd37d2993d6be772"
+      "bytes": 115187,
+      "sha256": "3822063e0004807d3afbb72f0fd8104b100c81b9f0ac0e48361460c814a8237d"
     },
     {
       "path": "protocol/EVIDENCE.md",
-      "bytes": 1794,
-      "sha256": "a42a1196b45eacec03394bf3997a31ab18eff7615f6d1fbbe372b12d7fde622c"
+      "bytes": 6355,
+      "sha256": "f28a8040a9bfe8672c3d95d0f72658eabbe5fcbe16dfbc31b96007a50e188359"
     },
     {
       "path": "protocol/OPCODES.md",
-      "bytes": 1818,
-      "sha256": "d6fae6b42579b498f92b483679bdabce84c179621403c8a573250a84dcea2eb2"
+      "bytes": 2438,
+      "sha256": "4ab28d91c68cb0a92aefd0f451e8c80259af2b7f74e0a10bae12d57f03da8306"
     },
     {
       "path": "protocol/STRUCTS.md",
-      "bytes": 2368,
-      "sha256": "daca3b701a66ecd8be48a074906345a3d1ea1d0e5943daec58789fee1778e722"
+      "bytes": 4435,
+      "sha256": "70d6173d48567f29febe0ec46eb2a63af8834b40ae1b253d5e13b8420348440c"
     },
     {
       "path": "protocol/opcodes.json",
-      "bytes": 1265,
-      "sha256": "8711786ade41934176e3e75a242ab1fd527690ed94eaf865dbd7270452f93113"
+      "bytes": 1344,
+      "sha256": "c84acbc976d78892d342c388a5257f637413f111db6c6b0be4da7935b3d06fd5"
     },
     {
       "path": "tools/apply_overlay.py",

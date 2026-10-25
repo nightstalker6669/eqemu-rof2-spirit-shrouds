@@ -1,8 +1,8 @@
 # EQEmu RoF2 Spirit Shrouds
 
-Spirit Shroud source extension for the **May 10, 2013 Rain of Fear 2 client**, using observed modern Live content adapted to that client. Published October 24, 2026. This is a partial implementation with a verified content and restoration baseline; full Live parity is not claimed.
+Production source extension for the **May 10, 2013 Rain of Fear 2 client**, adapting observed modern Live content. Full Live parity is not claimed. This update includes migrations **013–015**, corpse-domain XP accounting, system interaction safeguards and an optional native transformation path. Completed native checks and remaining physical acceptance limits are described in [STATUS.md](docs/STATUS.md).
 
-The current catalog enables **112 combinations: eight forms at levels 5, 10, 15, …, 70**. It includes native selection and previews, temporary profiles, original-profile escrow and restoration, earned-item retrieval, Monster Point allocation, 311 paid AA ranks and deferred positive original-character XP. Entering and removing a shroud currently reloads the zone.
+The catalog enables **112 combinations: eight first-branch forms at levels 5, 10, 15, …, 70**, covering all six underlying class types. It contains native selection/previews, profile escrow/restoration, earned-item retrieval, Monster Point purchases, **47 paid AA groups / 329 ranks**, and durable original-character XP/AA accounting. Enabled forms have no GM-only gate.
 
 | Family | Enabled form | Class |
 | --- | --- | --- |
@@ -15,37 +15,40 @@ The current catalog enables **112 combinations: eight forms at levels 5, 10, 15,
 | Reptiles | Basilisk Beast | Berserker |
 | Undead | Skeleton Wizard | Wizard |
 
-The other 26 standard branches have disabled preview records. Runed Gargoyle, complete family unlock progression, three AA groups, death/resurrection settlement and native transformation without zoning remain unfinished. See [known gaps](docs/KNOWN-GAPS.md) before deployment. Ordinary enabled forms have no GM-only gate.
+The other 26 standard branches (364 level variants) remain disabled. Exact family completion and later-branch unlock thresholds are explicitly **unknown**, stored as NULL rather than invented totals. Runed Gargoyle entitlement/content remains incomplete.
 
 ## Opcodes and structures
 
-The package documents **15 mapped Spirit Shroud messages** for the May 10, 2013 RoF2 client:
+The package maps **16 Spirit Shroud messages** for the matching RoF2 client:
 
-| Message | Opcode | Direction | Current use |
+| Message | Opcode | Direction | Use |
 | --- | --- | --- | --- |
 | Selection | 0x2ec3 | S→C | Keeper and delimited selection tree |
-| Request | 0x2b37 | C→S | Selected template details request |
-| Details | 0x6c04 | S→C | Template header and caret-delimited preview |
+| Request | 0x2b37 | C→S | Selected template details |
+| Details | 0x6c04 | S→C | Template header and preview |
 | Select | 0x1cd0 | C→S | Confirm selected template |
-| Cancel | 0x79da | C→S | Close/reset keeper menu |
-| ProgressAppend | 0x3823 | S→C | Native progression message family; full threshold behavior unfinished |
-| ProgressReplace | 0x541d | S→C | Progress display refresh; percentage remains provisional |
-| AbilityRequest | 0x3acc | C→S | Ability-preview cache request |
-| AbilityReady | 0x006e | S→C | Ability-preview ready signal |
-| EquipmentRequest | 0x4b25 | C→S | Equipment cache request |
-| Equipment | 0x2507 | S→C | Native item preview |
-| Transform | 0x6562 | S→C | Recovered mapping; native in-place flow not implemented |
+| Cancel | 0x79da | C→S | Close/reset menu |
+| ProgressAppend | 0x3823 | S→C | Native progression message family |
+| ProgressReplace | 0x541d | S→C | Evidence-gated progress refresh |
+| AbilityRequest | 0x3acc | C→S | Ability preview request |
+| AbilityReady | 0x006e | S→C | Ability preview readiness |
+| EquipmentRequest | 0x4b25 | C→S | Equipment preview request |
+| Equipment | 0x2507 | S→C | Native serialized item preview |
+| Transform | 0x6562 | S→C | Prepared in-place profile/spawn/inventory |
+| Complete | 0x7786 | C→S | Empty native completion acknowledgement |
 | Bank | 0x7b71 | Both | Bank action envelope |
-| BankItems | 0x1115 | S→C | Available earned items |
+| BankItems | 0x1115 | S→C | Earned-item list |
 | BankEmpty | 0x0728 | S→C | Empty-bank notification |
 
-- [Opcode inventory, directions and implementation status](protocol/OPCODES.md)
-- [Packet structures, field layouts and native transform envelope](protocol/STRUCTS.md)
-- [Machine-readable opcode mappings](protocol/opcodes.json)
-- [Recovery evidence and compatibility limits](protocol/EVIDENCE.md)
-- Production serializers: [wire.h](overlay/common/shroud/wire.h), [native_stats.h](overlay/common/shroud/native_stats.h) and [aa_preview.h](overlay/common/shroud/aa_preview.h)
+The existing shared **OP_Buff (`0x659c`, S→C)** also participates in native restoration; it is not a new shroud opcode. Its operation DWORD is **3** to recreate an empty native affect slot, **2** for ordinary duration updates and **1** for fade. Native counter/rune per-effect slot data remain unrecovered, so those saved states take reload fallback. The corrected long-buff288 restoration passed natively without reload, with client maxHP3348. The separate short-buff6886 transactional checkpoint correction is included; plain long288/short6886 native restoration now passed without reload; the separate saved-pet reload-fallback plain long/short-buff case also passed.
 
-The `0x6562` transformation mapping is recovered, but its native in-place flow remains unfinished. The empty `0x7786` completion acknowledgement is documented as a candidate and is not mapped or handled by this release. Monster AA operations reuse the existing AA packet families. A mapping alone does not establish complete gameplay support.
+- [Opcode inventory and directions](protocol/OPCODES.md)
+- [Packet structures and native transformation envelope](protocol/STRUCTS.md)
+- [Machine-readable opcode mappings](protocol/opcodes.json)
+- [Evidence and compatibility limits](protocol/EVIDENCE.md)
+- Production serializers: [wire.h](overlay/common/shroud/wire.h), [native_transform.h](overlay/common/shroud/native_transform.h) and [native_stats.h](overlay/common/shroud/native_stats.h)
+
+`Character:NativeSpiritShroudTransitions` defaults to **false**. With the rule enabled, the service prepares complete destination packets/caches before commit, exchanges caches behind a write fence, sends `0x6562`, and waits for empty `0x7786`. Unsupported states use the retained zone-reload fallback. The actual RoF2/server native batch passed 40 form/level cases and 80 entry/removal directions, covering transition revisions 139–218 and 280 recorded checks. A subsequent two-client pass verified Imp5/Bear70 observer transforms in both directions, and bounded group/raid continuity checks passed. The four tested commit-boundary process crashes and plain long/short buff restoration also passed; wider failure timing and complex counter/rune states remain unverified.
 
 ## Exact source dependencies
 
@@ -57,7 +60,7 @@ Apply in order:
 4. [Mercenaries](https://github.com/nightstalker6669/eqemu-rof2-mercenaries) `00b07c381a738a21aff08867bf186e6c2bfaffb0`.
 5. This extension.
 
-These dependencies describe the integrated source baseline and reused inventory ownership safeguards. Housing ownership and housing use are not shroud prerequisites. The companion code is supplied by those repositories rather than copied into this package.
+The companion repositories supply the integrated source baseline and shared inventory ownership safeguards. Housing ownership and housing use are not shroud prerequisites.
 
 ## Installation
 
@@ -68,17 +71,17 @@ python3 tools/apply_overlay.py /path/to/EQEmu --check
 python3 tools/apply_overlay.py /path/to/EQEmu --apply
 ```
 
-The guarded installer changes source only. SQL, builds, opcode configuration and service deployment are separate operator steps. The package excludes the provisional three-form starter catalog; retained runtime compatibility still permits existing legacy sessions to recover.
+The guarded installer changes source only. SQL, builds, opcode configuration and service deployment are separate operator steps. The provisional starter catalog is excluded; runtime compatibility preserves existing legacy-session recovery.
 
-Native inspection/restoration checks cover 33 distinct enabled combinations, including all six classes. One actual Monster Point purchase survived a full client relog and restored the original AA profile. These checks do not establish combat/death acceptance or all-form parity. See [status](docs/STATUS.md).
+Actual client/server acceptance passed 40 native self-client cases / 80 directions, separate observer/group/raid continuity, 19 landed combat cases across eight forms and six classes, selected paid-AA purchases and endpoint timers, solo/group/quest/100%-AA settlement, death/resurrection/restart accounting, and mercenary deferred-fee/restart cases. Earned-item trade/return, an exact-price sale, item-click charge/effect persistence through relog, native recovery-bank retrieval and guarded conservation cleanup also passed. Original plain long/short buffs passed native and supported saved-pet reload paths; one original AA cooldown passed escrow/return. Four real process-crash boundaries around entry/restoration commit plus a repeated recovery check passed committed-state recovery and exactly-once reward settlement. These are bounded cases: later branches, unknown thresholds, complex counter/rune representation, full combat/AA/bank matrices and wider failure timings remain incomplete. The native rule stays default off. See [status](docs/STATUS.md) and [known gaps](docs/KNOWN-GAPS.md).
 
 | Path | Contents |
 | --- | --- |
 | `overlay/` | New production sources and additive SQL migrations |
-| `patches/` | Integration patch and exact prerequisite source hashes |
-| `protocol/` | Opcode directions, layouts and recovery limits |
+| `patches/` | Integration patch and exact prerequisite hashes |
+| `protocol/` | Opcodes, layouts and recovery limits |
 | `docs/` | Install, architecture, gameplay, validation and gaps |
 | `tools/apply_overlay.py` | Guarded source installer |
 | `source-manifest.json` | Package inventory and SHA-256 hashes |
 
-Production source, SQL, installation tooling and documentation only. No test suites, fixtures, research scripts, captures, logs, database dumps, credentials, client assets, binaries or personal runtime configuration are distributed. GPLv3: see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Production source, SQL, installation tooling and documentation only. No tests, fixtures, research helpers, captures, logs, database dumps, credentials, client assets, binaries or private runtime configuration are distributed. GPLv3: [LICENSE](LICENSE), [NOTICE](NOTICE).

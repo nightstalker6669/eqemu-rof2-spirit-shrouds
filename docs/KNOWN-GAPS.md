@@ -1,107 +1,43 @@
-# Known gaps
+# Known gaps and compatibility policies
 
-**This release is incomplete. Death and resurrection are not implemented as Live
-shroud gameplay, and a known hover resurrection defect can destroy a corpse's
-recoverable XP claim without applying the credit.** A proposed repair has not been incorporated into the released implementation.
+This is modern Live content adapted to the May 10, 2013 RoF 2 client. Actual acceptance establishes the bounded cases in [status](STATUS.md), not complete modern Live or exact historical parity.
 
-## Death and resurrection
+## Content, stats and progression
 
-The temporary profile currently ignores XP decreases. Death therefore applies no
-shroud XP debit, and a shrouded corpse records zero refundable XP. Temporary
-possessions remain with the player rather than entering corpse custody. These
-safeguards prevent an unapplied loss from becoming an XP refund after restoration;
-they do not implement the reported Live loss and resurrection rules.
+Only eight first branches /112 level variants are enabled. The other 26 branches /364 variants, special forms and Runed Gargoyle entitlement path remain incomplete. Family completion and later-branch unlock thresholds remain NULL/unmeasured. Observed first-branch availability does not imply completed families. Unmeasured combat fields and skills retain emulator policy rather than invented Live values; full starter consumable stacks remain incomplete.
 
-The ordinary resurrection packet handler and central resurrection function refuse
-claims while shrouded. The same-zone hover-respawn caller nevertheless changes
-health/location, clears hover, and completes the corpse after the central refusal.
-Completing the corpse clears its refundable XP. An offer involving an original
-character's pre-entry corpse can therefore be consumed without restoring that XP.
+All 47 captured paid AA groups /329 ranks are represented. Attack Speed purchases/persistence and first/max timing, Improved Plane Shift endpoint casts and Enduring Voice endpoint casts passed. Complete intermediate-rank, stacking and shared-cooldown matrices remain unverified. The old RoF 2 haste display can omit a server-applied shroud AA contribution. Warlord's Tenacity and selected free spells retain documented RoF 2/modern-Live semantic differences; ordinary spell definitions remain unchanged.
 
-A complete solution needs durable corpse/session provenance, an actual recorded
-debit, a bounded refund claimed exactly once, and atomic corpse completion with
-ledger settlement. It must distinguish pre-entry corpses from current and previous
-shroud-session corpses. Current Live loss amounts, their level/curve basis and
-cross-profile resurrection rules have not been established. Do not enable those
-paths by deleting the existing refusal guards alone.
+## XP, death and resurrection
 
-## Incomplete forms and progression
+Bounded solo/group/quest/100%-AA reward and exactly-once restoration cases passed, including saved ordinary peer rewards and allocation restoration. Other reward scaling, raid edges, caps, level-up event hooks, fellowship and evolving-item XP integration remain incomplete or unverified. These tests establish configured emulator formulas, not Live reward balance.
 
-Only the first branch in each of eight families is enabled, across levels 5–70.
-The other 26 standard branches and their 364 preview combinations remain disabled.
-Special forms and their entitlement paths are incomplete. Preview data and shared
-classes are insufficient evidence for assigning active equipment or free ranks.
+Same-session and older restored-session corpse loss/refund cases passed, including 90% resurrection and tested restart persistence. Other corpse combinations and failure boundaries remain unverified. The death formula is emulator policy, not a measured Live conversion. Temporary possessions remain with the active shroud on death as an explicit conservation policy; Live corpse inventory semantics are not established. Legacy/untrusted corpse rows cannot authorize a new refundable loss.
 
-Family progress is stored separately, but exact later-branch unlock thresholds
-and Live progression units are unknown. The current progress percentage uses a
-provisional fixed conversion; it must not be interpreted as verified Live
-completion. Legacy starter progress has not been converted into completed Live
-families.
+## Interactions
 
-## Withheld paid groups
+Earned-item bilateral trade, exact-price merchant sale and one inventory click with actual relog/durable persistence passed. Starter trade/sale negatives established client-visible restriction and custody; they do not identify the server rejection branch. A nine-stage personal-bank bag/child and two-way coin roundtrip suite passed, including starter-bag rejection. Earned-child insertion into an issued starter bag and blocked bag transfer also passed with custody intact. Other transfer/item-click forms, full-inventory and additional bank failure boundaries remain unverified. Bulk Ctrl bank transfers, shared bank, parcels/world drops/tribute/augmentation and tradeskills remain restricted where provenance or behavior is not established. Earned gear may be carried but cannot contribute as equipped shroud gear.
 
-| Group | Reason |
-| --- | --- |
-| Attack Speed | The Live/client haste cache and effective combat/stacking interpretation remain unresolved. A displayed haste change does not prove the advertised combat effect. |
-| Enduring Voice | Its AA cooldown-reduction effect uses an unresolved target namespace and interpretation. |
-| Improved Plane Shift | Its AA cooldown-reduction targets cannot safely be inferred from the captured identifiers. |
+Deferred mercenary hire liability, insufficient funds, restart and upkeep-only subsequent resume passed with housing disabled. An existing paid contract also passed native level 70 → 5 → 70 scaling and automatic suspension with no additional charges, unchanged paid marker and conserved original custody. Insufficient funds never prevent original-profile restoration: the affected contract stays suspended with durable debt until normal resume can pay. Existing contracts do not acquire another hire fee. This is a compatibility policy; exact Live insufficient-funds and HP-rescaling responses remain unmeasured.
 
-These groups are unavailable even though their definitions were observed.
-Other captured paid chains are present, but every rank and interaction has not
-received native combat acceptance.
+Original pet checkpoint/escrow and one correctly owned saved-pet restoration passed through reload fallback. Charmed/engaged pets block entry; pet/charm form powers are not granted without evidence. In-place pet-actor reconstruction is not implemented. Bank expiry deletion remains disabled because lifetime/deletion semantics are unverified.
 
-## Spell compatibility exceptions
+## Native transformation and recovery
 
-Warlord's Tenacity uses the existing RoF2 spell definitions. They retain the older
-negative HP-per-tick decay and self-range value that differ from the observed
-modern Live payload. The client and ordinary spell database are not rewritten.
-This deliberate compatibility choice is not a claim of exact modern spell parity;
-actual cast behavior still needs acceptance.
+`Character:NativeSpiritShroudTransitions` defaults false. With it enabled, supported profiles use precommit packet/cache preparation and committed-state installation. Legacy/unversioned forms, saved destination pets, charm/illusion/mount buffs, hero-forge overrides and unsupported item/slot states deliberately use reload fallback. Failed queries, stale identity and malformed state abort before commit instead of silently selecting fallback. Completion 0x 7786 has no embedded revision; bounded pending state associates it with the current transition.
 
-Several previously captured free spells also retain existing RoF2 effect
-interpretations where modern Live payloads differ, including Hamstring, Swarm of
-Pain and Earth Bind. Matching spell IDs and costs alone do not establish identical
-effects across client generations.
+Actual coverage includes 40 self-client cases /80  directions /280 checks, Imp 5/Bear 70 observer directions and bounded two-client group/raid continuity. Raid combat, loot, task credit and leadership bonuses remain unverified. All enabled combinations, level/rank boundaries and ordinary zoning after every purchase are outside complete coverage.
 
-## Experience and level-up integration
+Real process deaths before and after entry commit and before and after restoration commit passed committed-profile recovery, durable-domain comparison and actual native reconnect. A final repeated removal/relog preserved a measured reward exactly once. A separate injected loader-failure rollback passed. This does not cover every database failure, packet loss, ACK timeout or reconnect timing.
 
-Positive original XP/AA rewards settle transactionally when the shroud is removed.
-The temporary form stays at its selected level. However, current Live conversion,
-quest reward scaling, death adjustments, group/raid edge cases and cap behavior
-have not been fully measured.
+Plain long 288/short 6886 buffs passed both native and saved-pet reload restoration, including client HP/effect slots and conserved original custody. Shroud-only Song capture and exact-latest-restoration loading leave ordinary SaveBuffs policy unchanged. One ordinary AA 487 cooldown escrow/return passed; complete Live buff/cooldown suspension semantics remain unmeasured, and absolute cooldown timestamps continue to age.
 
-The shroud reward path bypasses some ordinary XP processing, including fellowship
-and evolving-item integration and quest/event hooks. Direct settlement changes
-stored levels without running every ordinary level-up event path. Original buffs
-and cooldown rows are preserved, but full suspension/resumption semantics remain
-unverified; absolute cooldown timestamps continue to age.
+Existing RoF 2 OP_Buff 0x 659c operation 3 creates restored slots; operation 2 updates existing slots. Opaque per-effect slot_data remains unrecovered. Nonzero saved counter/rune states retain native reload fallback. Although the scoped short loader preserves server counter/rune fields, complex short-buff counter/rune client representation remains unproven; plain 288/6886 tests do not establish it.
 
-## Restricted systems and inventory
+Native recovery-bank plain-item Get, inspection, expiry denial and row-removal acknowledgement passed without reload, including a nine-charge earned click item after restoration. Bag/child retrieval, full inventory and interrupted Get commit cases remain unverified; unsupported reconstruction retains reload fallback.
 
-Current restrictions are broader than documented Live behavior. Active pets and
-mercenaries must be removed or suspended before entry. Mercenary controls are
-blocked while shrouded; automatic suspension, allowed shrouded mercenary use,
-scaling and contract repricing have not been completed.
+## Combat and deployment
 
-Bank transfers, shared-bank access, trading, merchant selling, parcel sending,
-crafting, augments, tribute and other ownership-changing operations are restricted.
-Normal characters retain their existing paths, but those restrictions should not
-be described as complete Live interaction parity.
+Exact current-session starter weapons bypass only monster-race equipment masks during damage eligibility; normal/acquired gear, class, level and immunity checks retain their paths. Actual corrected-build combat passed 19 bounded landed cases across eight 70 forms and six classes. Full balance, taunt/hate, avoidance/mitigation, positional mechanics and charm/pet combat remain unverified.
 
-Starter consumable stacks are omitted until stack-safe provenance exists. Stable
-starter tokens and earned children inside starter bags are handled, while the
-full inventory/currency overflow and failure matrix remains incomplete. Shroud
-bank retrieval uses a reload, and Live-style expiry is not implemented. Existing
-bank contents are not automatically deleted by an assumed timer.
-
-## Transformation and verification
-
-Entry, removal and bank retrieval currently rely on reloads. The recovered native
-in-place transformation flow, observer updates and complete packet/cache ordering
-are unfinished.
-
-Native checks cover 33 distinct form/level combinations, not all 112 enabled
-combinations. One purchase canary demonstrated relog persistence; ordinary zoning
-after purchases has not been verified. The complete combat, active-ability,
-group/raid, pet, mercenary, crash/restart and database-failure suites remain open.
-Passing builds, SQL validation or native inspection alone does not close them.
+Housing-disabled empty-inventory login passed for main and genuine-empty peer on the final integrated build. This does not enable housing gameplay or alter multi-account login rules. Full integrated world/zone builds passed; clean pinned apply/identity and changed-translation-unit checks remain distinct from a full clean-source link, which was not run.

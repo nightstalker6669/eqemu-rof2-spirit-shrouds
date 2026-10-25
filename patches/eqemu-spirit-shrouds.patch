@@ -1,3 +1,216 @@
+--- a/zone/housing_house_reload.cpp
++++ b/zone/housing_house_reload.cpp
+@@ -5,6 +5,7 @@
+ #include "client.h"
+ #include "zonedb.h"
+ #include "../common/eqemu_config.h"
++#include "../common/rulesys.h"
+ #include <mutex>
+ namespace Housing::HousePreload {
+ namespace {
+@@ -30,7 +31,11 @@
+ }
+ ZonePolicies CurrentZonePolicies(){std::lock_guard<std::mutex> guard(policy_mutex);return policies;}
+ bool LoadInventoryWithHouseBindings(Client& client,ZoneDatabase& loader,bool enabled){
+- auto held=[&client]{return client.HasInventorySessionReservation();};
++ std::function<bool()> held;
++ if(client.InventorySessionReleaseTicket() ||
++    (client.ClientVersion()==EQ::versions::ClientVersion::RoF2 &&
++     (RuleB(Housing,EnablePlayerHousing)||RuleB(Mercs,AllowMercs))))
++  held=[&client]{return client.HasInventorySessionReservation();};
+  if(!enabled||client.ClientVersion()!=EQ::versions::ClientVersion::RoF2)return loader.GetInventory(&client,held);
+  try{
+   if(client.ClientDataLoaded())return false;
+--- a/common/shareddb.cpp
++++ b/common/shareddb.cpp
+@@ -657,7 +657,17 @@
+ 	uint32                char_id = c->CharacterID();
+ 	EQ::InventoryProfile &inv     = c->GetInv();
+ 	struct ClearLoadGuids { ~ClearLoadGuids() { EQ::ItemInstance::ClearGUIDMap(); } } clear_load_guids;
+-	const bool checked_load = RuleB(Housing, EnablePlayerHousing);
++	// Inventory ownership is also shared by mercenary payments when housing is
++	// disabled. Retain checked loading for an existing lease after a rule change.
++	const bool housing_load = RuleB(Housing, EnablePlayerHousing);
++	const bool checked_load = housing_load || bool(session_fence);
++	const auto load_query_failures = QueryFailureGeneration();
++	auto load_shared_bank = [&]() {
++		if (checked_load && (!session_fence || !session_fence() ||
++			QueryFailureGeneration() != load_query_failures)) return false;
++		const bool loaded = GetSharedBank(char_id, &inv, true);
++		return loaded && (!checked_load || (QueryFailureGeneration() == load_query_failures && session_fence()));
++	};
+ 	if (loaded_witnesses && !checked_load) return false;
+ 	InventoryRepository::LoadSnapshot load_snapshot;
+ 	std::vector<Housing::HousePreload::Loaded> prepared_witnesses;
+@@ -677,9 +687,10 @@
+ 	auto e_results = CharacterEvolvingItemsRepository::GetWhere(
+ 		*this, fmt::format("`character_id` = '{}' AND `deleted_at` IS NULL", char_id)
+ 	);
++	if (checked_load && QueryFailureGeneration() != load_query_failures) return false;
+ 
+ 	if (results.empty()) {
+-		if (checked_load) return session_fence() && GetSharedBank(char_id, &inv, true);
++		if (checked_load) return load_shared_bank();
+ 		LogError("Error loading inventory for char_id {} from the database.", char_id);
+ 		return false;
+ 	}
+@@ -767,7 +778,7 @@
+ 
+ 		inst->SetOrnamentIcon(ornament_icon);
+ 		inst->SetOrnamentationIDFile(ornament_idfile);
+-		inst->SetOrnamentHeroModel(checked_load && item->HousingDefinitionID ? ornament_hero_model : item->HerosForgeModel);
++		inst->SetOrnamentHeroModel(housing_load && item->HousingDefinitionID ? ornament_hero_model : item->HerosForgeModel);
+ 
+ 		if (
+ 			instnodrop ||
+@@ -906,7 +917,7 @@
+ 	EQ::ItemInstance::ClearGUIDMap();
+ 
+ 	// Retrieve shared inventory
+-	const bool shared_bank_loaded = GetSharedBank(char_id, &inv, true);
++	const bool shared_bank_loaded = load_shared_bank();
+ 	if (shared_bank_loaded && loaded_witnesses) loaded_witnesses->swap(prepared_witnesses);
+ 	return shared_bank_loaded;
+ }
+--- a/zone/raids.cpp
++++ b/zone/raids.cpp
+@@ -513,6 +513,39 @@
+ 
+ 	LearnMembers();
+ 	VerifyRaid();
++}
++
++bool Raid::RefreshMemberProfile(Client *client, uint8 class_id, uint8 level)
++{
++	if (!client || class_id < 1 || class_id > 16 || level < 1 || level > 126 || !zone) {
++		return false;
++	}
++	RaidMember *subject = nullptr;
++	for (auto &member : members) {
++		if (member.member == client && !member.is_bot && !strcmp(member.member_name, client->GetName())) {
++			if (subject) return false;
++			subject = &member;
++		}
++	}
++	if (!subject) return false;
++	// The transaction updated only these columns. Keep every other cached
++	// member/role field intact instead of clearing and reloading the array.
++	subject->_class = class_id;
++	subject->level = level;
++	// Existing group-move refresh rebuilds the subject's native raid window
++	// and replaces its row for observers without changing server membership.
++	SendRaidMoveAll(client->GetName());
++	ServerPacket update(ServerOP_RaidChangeGroup, sizeof(ServerRaidGeneralAction_Struct));
++	auto *action = reinterpret_cast<ServerRaidGeneralAction_Struct *>(update.pBuffer);
++	*action = {};
++	action->rid = GetID();
++	action->gid = subject->group_number;
++	action->zoneid = zone->GetZoneID();
++	action->instance_id = zone->GetInstanceID();
++	strn0cpy(action->playername, client->GetName(), sizeof(action->playername));
++	// Other zones already handle this message by reloading the committed raid
++	// rows and replacing the same native UI row. The origin zone is ignored.
++	return worldserver.SendPacket(&update);
+ }
+ 
+ uint32 Raid::GetFreeGroup()
+--- a/zone/raids.h
++++ b/zone/raids.h
+@@ -128,6 +128,9 @@
+ 	bool	IsRaidMember(const char* name);
+ 	bool	IsRaidMember(Client *c);
+ 	void	UpdateLevel(const char *name, int newLevel);
++	// Called after a shroud transaction has committed the same member's class
++	// and level. Does not change membership, groups, leadership or loot roles.
++	bool RefreshMemberProfile(Client *member, uint8 class_id, uint8 level);
+ 	void	SetNewRaidLeader(uint32 i);
+ 	bool    IsAssister(const char* who);
+ 	bool    IsMarker(const char* who);
+--- a/zone/entity.cpp
++++ b/zone/entity.cpp
+@@ -1169,7 +1169,10 @@
+ 	if (get_id == 0)
+ 		return nullptr;
+ 
+-	if ((ent = entity_list.GetEntityMob(get_id)))
++	// A hovering client's map key still names its former spawn, but its
++ // current ID is zero (or a new spawn after respawn). That stale entry
++ // must not hide the corpse which legitimately retained the requested ID.
++ if ((ent = entity_list.GetEntityMob(get_id)) && ent->GetID() == get_id)
+ 		return ent->CastToMob();
+ 	else if ((ent = entity_list.GetEntityCorpse(get_id)))
+ 		return ent->CastToMob();
+--- a/zone/housing_item_reconstruction.h
++++ b/zone/housing_item_reconstruction.h
+@@ -15,5 +15,8 @@
+ // current runtime serial are checked independently by LiveItems/fence callbacks.
+ bool MatchesProjection(const LiveItems::InventoryRow&,EQ::ItemInstance&);
+ LiveItems::Result<ReconstructedItem> Reconstruct(SharedDatabase&,const LiveItems::InventoryRow&);
++// Reload owned character inventory, including bound bags. This bypasses only
++// housing transfer admission; all instance/tree fidelity checks still apply.
++LiveItems::Result<ReconstructedItem> ReconstructCharacterProfile(SharedDatabase&,const LiveItems::InventoryRow&);
+ }
+ #endif
+--- a/zone/housing_item_reconstruction.cpp
++++ b/zone/housing_item_reconstruction.cpp
+@@ -8,11 +8,12 @@
+ using InventoryProjection::Custom;
+ using InventoryProjection::Charges;
+ bool MatchesProjection(const LiveItems::InventoryRow& row,EQ::ItemInstance& item){return InventoryProjection::Matches(row,item);}
+-LiveItems::Result<ReconstructedItem> Reconstruct(SharedDatabase& db,const LiveItems::InventoryRow& row){
++namespace {
++LiveItems::Result<ReconstructedItem> ReconstructInScope(SharedDatabase& db,const LiveItems::InventoryRow& row,InventoryProjection::ReconstructionScope scope){
+  try{
+   if(!Shape(row))return {{},LiveItems::Error::UnsupportedItem};auto fields=Custom(row.values.custom_data);if(!fields)return {{},LiveItems::Error::UnsupportedItem};
+   const auto* data=db.GetItem(row.values.item_id);
+-  if(!data||((data->ItemClass!=0||data->BagSlots)&&!InventoryProjection::VaultCandidate(*data)))return {{},LiveItems::Error::UnsupportedItem};
++  if(!data||data->ItemClass>2||(scope==InventoryProjection::ReconstructionScope::HousingTransfer && (data->ItemClass!=0||data->BagSlots)&&!InventoryProjection::VaultCandidate(*data)))return {{},LiveItems::Error::UnsupportedItem};
+   // Reserve legacy GUID before allocating a fresh native serial; GUID may be
+   // NULL,0 or wider than signed32 and remains verbatim in the original row.
+   if(!(row.null_fields&LiveItems::NullGuid)&&row.values.guid)EQ::ItemInstance::AddGUIDToMap(row.values.guid);
+@@ -24,10 +25,17 @@
+   for(const auto& [key,value]:*fields)item->SetCustomData(key,value);
+   if(!LegacyScaling::Restore(*item,row.values.custom_data))return {{},LiveItems::Error::UnsupportedItem};
+   if(!EvolvingItemCustody::Restore(row.evolving_payload,*item,row.values.character_id))return {{},LiveItems::Error::UnsupportedItem};
+-  for(const auto& child:row.children){auto rebuilt=Reconstruct(db,child);if(!rebuilt)return {{},rebuilt.error};item->PutItem(uint8_t(child.values.slot_id),*rebuilt.value.item);}
+-  if(!MatchesProjection(row,*item))return {{},LiveItems::Error::UnsupportedItem};
++  for(const auto& child:row.children){auto rebuilt=ReconstructInScope(db,child,scope);if(!rebuilt)return {{},rebuilt.error};item->PutItem(uint8_t(child.values.slot_id),*rebuilt.value.item);}
++  if(!InventoryProjection::Matches(row,*item,scope))return {{},LiveItems::Error::UnsupportedItem};
+   ReconstructedItem output;output.original=row;output.runtime_serial=item->GetSerialNumber();output.item=std::move(item);
+   LiveItems::Result<ReconstructedItem> result;result.value=std::move(output);return result;
+  }catch(...){return {{},LiveItems::Error::UnsupportedItem};}
+ }
++ } // namespace
++LiveItems::Result<ReconstructedItem> Reconstruct(SharedDatabase& db,const LiveItems::InventoryRow& row){
++ return ReconstructInScope(db,row,InventoryProjection::ReconstructionScope::HousingTransfer);
+ }
++LiveItems::Result<ReconstructedItem> ReconstructCharacterProfile(SharedDatabase& db,const LiveItems::InventoryRow& row){
++ return ReconstructInScope(db,row,InventoryProjection::ReconstructionScope::CharacterProfile);
++}
++}
+--- a/common/housing/inventory_projection.h
++++ b/common/housing/inventory_projection.h
+@@ -29,14 +29,17 @@
+ // color when the persisted instance color is zero. Bags/books default to zero.
+ inline uint32_t Color(const LiveItems::InventoryRow& row,const EQ::ItemData& data){return row.values.color?row.values.color:(data.IsClassCommon()?data.Color:0u);}
+ inline bool VaultCandidate(const EQ::ItemData& data){return !data.Placeable&&!data.NoTransfer&&data.ItemClass<=2&&(data.ItemClass==1||!data.BagSlots);}
+-inline bool Matches(const LiveItems::InventoryRow& row,EQ::ItemInstance& item){
++enum class ReconstructionScope { HousingTransfer, CharacterProfile };
++// Character-profile reload is not a transfer. Housing callers retain the
++// original strict admission policy unless this explicit scope is selected.
++inline bool Matches(const LiveItems::InventoryRow& row,EQ::ItemInstance& item,ReconstructionScope scope=ReconstructionScope::HousingTransfer){
+  const auto& r=row.values;const auto* data=item.GetItem();
+- if(!Shape(row)||!data||data->ID!=r.item_id||((data->ItemClass!=0||data->BagSlots)&&!VaultCandidate(*data))||!LegacyScaling::Matches(r.custom_data,item)||item.GetSerialNumber()<=0||!EvolvingItemCustody::Matches(row.evolving_payload,item,r.character_id))return false;
++ if(!Shape(row)||!data||data->ID!=r.item_id||(data->ItemClass>2 || (scope==ReconstructionScope::HousingTransfer && (data->ItemClass!=0||data->BagSlots)&&!VaultCandidate(*data)))||!LegacyScaling::Matches(r.custom_data,item)||item.GetSerialNumber()<=0||!EvolvingItemCustody::Matches(row.evolving_payload,item,r.character_id))return false;
+  const std::array<uint32_t,6> augments{r.augment_one,r.augment_two,r.augment_three,r.augment_four,r.augment_five,r.augment_six};
+  size_t augment_count=0;for(size_t i=0;i<augments.size();++i){if(data->ItemClass!=EQ::item::ItemClassBag&&item.GetAugmentItemID(uint8_t(i))!=augments[i])return false;if(augments[i])++augment_count;}
+  if(data->ItemClass==EQ::item::ItemClassBag){
+   if(augment_count||item.GetContents()->size()!=row.children.size()||data->BagSlots>CustodyCodec::MaximumBagSlots)return false;
+-  for(const auto& child:row.children){auto found=item.GetContents()->find(uint8_t(child.values.slot_id));if(child.values.slot_id>=data->BagSlots||found==item.GetContents()->end()||!found->second||!Matches(child,*found->second))return false;}
++  for(const auto& child:row.children){auto found=item.GetContents()->find(uint8_t(child.values.slot_id));if(child.values.slot_id>=data->BagSlots||found==item.GetContents()->end()||!found->second||!Matches(child,*found->second,scope))return false;}
+  }else if(!row.children.empty()||item.GetContents()->size()!=augment_count)return false;
+  auto fields=Custom(r.custom_data);if(!fields)return false;
+  return item.GetCharges()==Charges(row,*data)&&item.GetColor()==Color(row,*data)&&item.IsAttuned()==bool(r.instnodrop)&&
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
 @@ -870,6 +870,7 @@
@@ -8,6 +221,43 @@
  ENDIF (UNIX)
  
  IF (EQEMU_BUILD_PCH)
+--- a/common/inventory_profile.h
++++ b/common/inventory_profile.h
+@@ -51,6 +51,7 @@
+ {
+ public:
+ 	~ItemInstQueue();
++	void Swap(ItemInstQueue& other) noexcept { m_list.swap(other.m_list); }
+ 	/////////////////////////
+ 	// Public Methods
+ 	/////////////////////////
+@@ -96,6 +97,13 @@
+ 			m_lookup = inventory::StaticLookup(versions::MobVersion::Unknown);
+ 		}
+ 		~InventoryProfile();
++		// Exchange only character-profile ownership. Shared-bank/account and
++		// trade buckets, lookup/version and GM policy remain with this Client.
++		void SwapProfileInventory(InventoryProfile& other) noexcept {
++			m_worn.swap(other.m_worn);m_inv.swap(other.m_inv);
++			m_bank.swap(other.m_bank);m_cursor.Swap(other.m_cursor);
++		}
++
+ 
+ 		void SetInventoryVersion(versions::MobVersion inventory_version);
+ 		void SetInventoryVersion(versions::ClientVersion client_version) { SetInventoryVersion(versions::ConvertClientVersionToMobVersion(client_version)); }
+--- a/common/ptimer.h
++++ b/common/ptimer.h
+@@ -111,6 +111,10 @@
+ 	PTimerList(uint32 char_id = 0);
+ 
+ 	~PTimerList();
++	void Swap(PTimerList& other) noexcept {
++		std::swap(_char_id,other._char_id);_list.swap(other._list);
++	}
++
+ 
+ 	bool Load(Database *db);
+ 	bool Store(Database *db);
 --- a/common/dbcore.cpp
 +++ b/common/dbcore.cpp
 @@ -101,6 +101,7 @@
@@ -68,7 +318,7 @@
  
 --- a/common/emu_oplist.h
 +++ b/common/emu_oplist.h
-@@ -709,3 +709,20 @@
+@@ -709,3 +709,21 @@
  N(OP_GuildTrophyModify),
  
  N(OP_GuildTrophyOptIn),
@@ -86,6 +336,7 @@
 +N(OP_SpiritShroudEquipmentRequest),
 +N(OP_SpiritShroudEquipment),
 +N(OP_SpiritShroudTransform),
++N(OP_SpiritShroudComplete),
 +N(OP_SpiritShroudBank),
 +N(OP_SpiritShroudBankItems),
 +N(OP_SpiritShroudBankEmpty),
@@ -110,11 +361,83 @@
  #include "../mercenary/rof2_wire.h"
  #include "../housing/plot_find_wire.h"
  #include "../housing/npc_item_metadata.h"
-@@ -70,6 +71,18 @@
+@@ -47,6 +48,7 @@
+ #include <sstream>
+ #include <numeric>
+ #include <cassert>
++#include <set>
+ #include <cinttypes>
+ 
+ 
+@@ -70,6 +72,82 @@
  			return true;
  		}
  	}
 +
++ namespace {
++ class ShroudEncodingSink final : public EQStreamInterface {
++ public:
++  std::vector<std::vector<uint8_t>> packets;
++  void QueuePacket(const EQApplicationPacket* p,bool=true) override {if(p)packets.emplace_back(p->pBuffer,p->pBuffer+p->size);}
++  void FastQueuePacket(EQApplicationPacket** p,bool ack=true) override {if(p&&*p){QueuePacket(*p,ack);delete *p;*p=nullptr;}}
++  EQApplicationPacket* PopPacket() override {return nullptr;}
++  void Close() override {} void ReleaseFromUse() override {} void RemoveData() override {}
++  std::string GetRemoteAddr() const override {return {};}
++  uint32 GetRemoteIP() const override {return 0;} uint16 GetRemotePort() const override {return 0;}
++  bool CheckState(EQStreamState) override {return false;} std::string Describe() const override {return "RoF2 prepared encoding";}
++  EQStreamState GetState() override {return CLOSED;}
++  void SetOpcodeManager(OpcodeManager**) override {} OpcodeManager* GetOpcodeManager() const override {return nullptr;}
++  Stats GetStats() const override {return {};}
++  void ResetStats() override {} EQStreamManagerInterface* GetManager() const override {return nullptr;}
++ };
++ std::optional<std::vector<uint8_t>> ShroudEncode(EmuOpcode opcode,const void* data,size_t size) {
++  if(!data||!size||size>16*1024*1024)return std::nullopt;
++  auto sink=std::make_shared<ShroudEncodingSink>();auto* packet=new EQApplicationPacket(opcode,size);
++  std::memcpy(packet->pBuffer,data,size);struct_strategy.Encode(&packet,sink,false);delete packet;
++  if(sink->packets.size()!=1||sink->packets.front().empty())return std::nullopt;
++  return std::move(sink->packets.front());
++ }
++ }
++ std::optional<std::vector<uint8_t>> SerializeShroudSpawn(const Spawn_Struct& spawn) {
++  return ShroudEncode(OP_ZoneSpawns,&spawn,sizeof(spawn));
++ }
++ std::optional<std::vector<uint8_t>> SerializeShroudNormalProfile(const PlayerProfile_Struct& profile) {
++  return ShroudEncode(OP_PlayerProfile,&profile,sizeof(profile));
++ }
++ std::optional<std::vector<uint8_t>> SerializeShroudInventory(const std::vector<std::pair<int16_t,const EQ::ItemInstance*>>& roots) {
++  if(roots.size()>4096)return std::nullopt;EQ::OutBuffer out;
++  uint32_t count=roots.size();out.write(reinterpret_cast<const char*>(&count),sizeof(count));
++  size_t nodes=0;std::set<int16_t> slots;
++  const auto valid_tree=[&](const auto& self,const EQ::ItemInstance& item,size_t depth)->bool {
++   if(depth>8 || ++nodes>4096 || !item.GetUnscaledItem() || item.GetMerchantSlot())return false;
++   for(uint8_t slot=EQ::invbag::SLOT_BEGIN;slot<=EQ::invbag::SLOT_END;++slot)
++    if(const auto* child=item.GetItem(slot);child && !self(self,*child,depth+1))return false;
++   return true;
++  };
++  for(const auto& root:roots){
++   if(!root.second||!slots.insert(root.first).second||!valid_tree(valid_tree,*root.second,0))return std::nullopt;
++   const auto previous=out.tellp();SerializeItem(out,root.second,root.first,0,ItemPacketCharInventory);
++   if(out.tellp()<=previous||out.size()>16*1024*1024)return std::nullopt;
++  }
++  const auto size=out.size();auto* bytes=out.detach();std::vector<uint8_t> result(bytes,bytes+size);delete[] bytes;return result;
++ }
++ std::optional<std::vector<uint8_t>> SerializeShroudBankItem(const EQ::ItemInstance& item,int16_t slot) {
++  if(slot<EQ::invslot::GENERAL_BEGIN || slot>EQ::invslot::GENERAL_END)return std::nullopt;
++  size_t nodes=0;
++  const auto valid=[&](const auto& self,const EQ::ItemInstance& value,size_t depth)->bool {
++   if(depth>8 || ++nodes>4096 || !value.GetUnscaledItem() || value.GetMerchantSlot())return false;
++   for(uint8_t i=EQ::invbag::SLOT_BEGIN;i<=EQ::invbag::SLOT_END;++i)
++    if(const auto* child=value.GetItem(i);child && !self(self,*child,depth+1))return false;
++   return true;
++  };
++  if(!valid(valid,item,0))return std::nullopt;
++  const auto serialized=item.Serialize(slot);std::vector<uint8_t> input(4+serialized.size());
++  const uint32_t type=ItemPacketTrade;std::memcpy(input.data(),&type,4);
++  std::memcpy(input.data()+4,serialized.data(),serialized.size());
++  auto bytes=ShroudEncode(OP_ItemPacket,input.data(),input.size());
++  if(!bytes || bytes->size()<=4 || bytes->size()>16*1024*1024)return std::nullopt;
++  return bytes;
++ }
 + std::optional<std::vector<uint8_t>> SerializeShroudPreviewItem(const EQ::ItemInstance &instance)
 + {
 +  if(!instance.GetUnscaledItem() || instance.GetMerchantSlot())return std::nullopt;
@@ -129,7 +452,18 @@
  
  	std::optional<std::vector<uint8_t>> SerializeHousingItem(
  		const EQ::ItemInstance &instance, int16_t server_slot)
-@@ -1996,6 +2009,25 @@
+@@ -737,7 +815,9 @@
+ 		OUT(buff.z);
+ 		eq->slotid = ServerToRoF2BuffSlot(emu->slotid);
+ 		// TODO: implement slot_data stuff
+-		if (emu->bufffade == 1)
++		if (emu->bufffade == 3)
++			eq->bufffade = 3; // Explicit native alternate-profile slot reconstruction.
++		else if (emu->bufffade == 1)
+ 			eq->bufffade = 1;
+ 		else
+ 			eq->bufffade = 2;
+@@ -1996,6 +2076,25 @@
  		FINISH_ENCODE();
  	}
  
@@ -155,7 +489,7 @@
  	ENCODE(OP_Illusion)
  	{
  		ENCODE_LENGTH_EXACT(Illusion_Struct);
-@@ -2473,8 +2505,8 @@
+@@ -2473,8 +2572,8 @@
  		outapp->WriteUInt32(0);		// Checksum, we will update this later
  		outapp->WriteUInt32(0);		// Checksum size, we will update this later
  
@@ -166,7 +500,7 @@
  
  
  		outapp->WriteUInt8(emu->gender);	// Gender
-@@ -2847,30 +2879,36 @@
+@@ -2847,30 +2946,36 @@
  		}
  
  		outapp->WriteSInt32(-1);	// Unknown;
@@ -227,7 +561,7 @@
  		outapp->WriteUInt32(emu->endurance);
  		outapp->WriteUInt32(0);		// Unknown - Observed 0x7cde - This is also seen in guild packets sent to this character.
  		outapp->WriteUInt32(0);		// Unknown - Observed 0x64
-@@ -3467,7 +3505,7 @@
+@@ -3467,7 +3572,7 @@
  		outapp->WriteUInt32(emu->charges);
  		outapp->WriteSInt32(emu->expansion);
  		outapp->WriteSInt32(emu->category);
@@ -238,13 +572,27 @@
  		outapp->WriteUInt8(0); // unknown111
 --- a/common/patches/rof2.h
 +++ b/common/patches/rof2.h
-@@ -37,6 +37,9 @@
+@@ -30,6 +30,8 @@
+ namespace EQ { class ItemInstance; }
+ 
+ class EQStreamIdentifier;
++struct Spawn_Struct;
++struct PlayerProfile_Struct;
+ 
+ namespace RoF2
+ {
+@@ -37,6 +39,14 @@
  	//these are the only public member of this namespace.
  	extern void Register(EQStreamIdentifier &into);
  	extern void Reload();
++ std::optional<std::vector<uint8_t>> SerializeShroudSpawn(const Spawn_Struct&);
++ std::optional<std::vector<uint8_t>> SerializeShroudNormalProfile(const PlayerProfile_Struct&);
++ std::optional<std::vector<uint8_t>> SerializeShroudInventory(const std::vector<std::pair<int16_t,const EQ::ItemInstance*>>&);
 + // Shroud inspection cache entry: native ItemPtr without an ItemPacket type
 + // or inventory count. This service has no housing rule dependency.
 + std::optional<std::vector<uint8_t>> SerializeShroudPreviewItem(const EQ::ItemInstance &instance);
++ // Fully encoded normal ItemPacketTrade for a prepared recovery-bank tree.
++ std::optional<std::vector<uint8_t>> SerializeShroudBankItem(const EQ::ItemInstance&,int16_t server_slot);
  	// Native embedded ItemPtr, without the OP_ItemPacket type DWORD. Uses the
  	// ordinary item encoder and preserves instance identity, charges and children.
  	// Housing must be enabled. Full inventory trees and compact estate list
@@ -261,10 +609,11 @@
  E(OP_InspectRequest)
 --- a/common/ruletypes.h
 +++ b/common/ruletypes.h
-@@ -39,6 +39,8 @@
+@@ -39,6 +39,9 @@
  
  
  RULE_CATEGORY(Character)
++RULE_BOOL(Character, NativeSpiritShroudTransitions, false, "Use checked native in-place RoF2 shroud transitions; unsupported destination states retain the reload fallback")
 +RULE_BOOL(Character, EnableSpiritShrouds, false, "Enable transactional RoF2 Spirit Shrouds after applying shroud migrations")
 +RULE_BOOL(Character, AllowTestSpiritShrouds, true, "Allow the separately marked starter Spirit Shroud catalog while Live content research is incomplete")
  RULE_INT(Character, MaxLevel, 65, "Sets the highest level for players that can be reached through experience")
@@ -272,7 +621,7 @@
  RULE_BOOL(Character, PerCharacterBucketMaxLevel, false, "Check for data bucket 'CharMaxLevel', if player tries to level beyond that point, it will not go beyond that level")
 --- a/utils/patches/patch_RoF2.conf
 +++ b/utils/patches/patch_RoF2.conf
-@@ -849,3 +849,20 @@
+@@ -849,3 +849,21 @@
  OP_MercenaryCostUpdate=0x3cbc
  OP_MercenaryCurrencyMessage=0x29ec
  OP_MercenaryTimerUpdate=0x2b4f
@@ -290,6 +639,7 @@
 +OP_SpiritShroudEquipmentRequest=0x4b25
 +OP_SpiritShroudEquipment=0x2507
 +OP_SpiritShroudTransform=0x6562
++OP_SpiritShroudComplete=0x7786
 +OP_SpiritShroudBank=0x7b71
 +OP_SpiritShroudBankItems=0x1115
 +OP_SpiritShroudBankEmpty=0x0728
@@ -313,11 +663,12 @@
  		cse->Gender      = e.gender;
 --- a/zone/CMakeLists.txt
 +++ b/zone/CMakeLists.txt
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,8 @@
      botspellsai.cpp
      cheat_manager.cpp
      client.cpp
 +    client_spirit_shroud.cpp
++    client_spirit_shroud_native.cpp
      client_evolving_items.cpp
      fellowship_campfire.cpp
      fellowship_campsite_bonuses.cpp
@@ -483,7 +834,26 @@
  				aa2->aa_list[i].charges = charges;
  				i++;
  			}
-@@ -1107,6 +1176,11 @@
+@@ -1054,6 +1123,18 @@
+ }
+ 
+ void Client::ResetAlternateAdvancementTimer(int ability) {
++	if (IsSpiritShrouded()) {
++		auto *rank = zone->GetAlternateAdvancementRank(ability);
++		if (!rank || !rank->base_ability || rank->base_ability->category != AACategory::ShroudActive ||
++			!HasSpiritShroudRank(rank->id) || GetAA(rank->id) < uint32_t(rank->current_value) ||
++			rank->spell_type < 0 || rank->spell_type > pTimerAAEnd - pTimerAAStart) return;
++		// A failed shorter cast must not erase an earlier shared start which
++		// still controls another ability with a longer queried reuse time.
++		auto *prior = p_timers.Get(rank->spell_type + pTimerAAStart);
++		SendAlternateAdvancementTimer(rank->spell_type,
++			prior && prior->Enabled() ? prior->GetStartTime() : 0, time(nullptr));
++		return;
++	}
+ 	AA::Rank *rank = zone->GetAlternateAdvancementRank(casting_spell_aa_id);
+ 	if(rank) {
+ 		SendAlternateAdvancementTimer(rank->spell_type, 0, time(0));
+@@ -1107,6 +1188,11 @@
  }
  
  void Client::PurchaseAlternateAdvancementRank(int rank_id) {
@@ -495,7 +865,7 @@
  	AA::Rank *rank = zone->GetAlternateAdvancementRank(rank_id);
  	if(!rank) {
  		return;
-@@ -1124,6 +1198,8 @@
+@@ -1124,6 +1210,8 @@
  }
  
  bool Client::GrantAlternateAdvancementAbility(int aa_id, int points, bool ignore_cost) {
@@ -504,7 +874,7 @@
  	bool ret = false;
  	for(int i = 1; i <= points; ++i) {
  		auto ability_rank = zone->GetAlternateAdvancementAbilityAndRank(aa_id, i);
-@@ -1150,6 +1226,8 @@
+@@ -1150,6 +1238,8 @@
  }
  
  void Client::FinishAlternateAdvancementPurchase(AA::Rank *rank, bool ignore_cost, bool send_message_and_save) {
@@ -513,7 +883,7 @@
  	auto rank_id = rank->base_ability->first_rank_id;
  
  	if (rank->base_ability->charges) {
-@@ -1281,6 +1359,15 @@
+@@ -1281,13 +1371,40 @@
  	// We don't have the AA
  	if (!GetAA(rank_id, &charges))
  		return;
@@ -529,7 +899,63 @@
  	//if expendable make sure we have charges
  	if (ability->charges > 0 && charges < 1)
  		return;
-@@ -1573,17 +1660,14 @@
+ 
+-	//check cooldown
+-	if (!p_timers.Expired(&database, rank->spell_type + pTimerAAStart, false)) {
+-		uint32 aaremain = p_timers.GetRemainingTime(rank->spell_type + pTimerAAStart);
++	int timer_duration = 0;
++	uint32 aaremain = 0;
++	bool cooldown_blocked = false;
++	if (IsSpiritShrouded()) {
++		timer_duration = std::max(0, rank->recast_time - GetAlternateAdvancementCooldownReduction(rank));
++		// RoF2 shares the start, then adds the queried AA's own reduced reuse.
++		// Do not call Expired: it can delete a still-relevant shared start.
++		auto *prior = p_timers.Get(rank->spell_type + pTimerAAStart);
++		if (timer_duration && prior && prior->Enabled()) {
++			const uint64 deadline = uint64(prior->GetStartTime()) + uint64(timer_duration);
++			const uint64 now = uint64(time(nullptr));
++			if (now < deadline) {
++				cooldown_blocked = true;
++				aaremain = uint32(std::min<uint64>(deadline - now, UINT32_MAX));
++			}
++		}
++	} else if (!p_timers.Expired(&database, rank->spell_type + pTimerAAStart, false)) {
++		cooldown_blocked = true;
++		aaremain = p_timers.GetRemainingTime(rank->spell_type + pTimerAAStart);
++	}
++	if (cooldown_blocked) {
+ 		uint32 aaremain_hr = aaremain / (60 * 60);
+ 		uint32 aaremain_min = (aaremain / 60) % 60;
+ 		uint32 aaremain_sec = aaremain % 60;
+@@ -1304,9 +1421,24 @@
+ 		return;
+ 	}
+ 
+-	int timer_duration = rank->recast_time - GetAlternateAdvancementCooldownReduction(rank);
+-	if (timer_duration < 0) {
+-		timer_duration = 0;
++	if (!IsSpiritShrouded()) {
++		timer_duration = rank->recast_time - GetAlternateAdvancementCooldownReduction(rank);
++		if (timer_duration < 0) {
++			timer_duration = 0;
++		}
++	} else {
++		// The stored duration only retains the start through every offered
++		// query, including later purchases and reconnects. It is not the
++		// cooldown of the ability being activated; eligibility above is.
++		for (auto rank_id : m_spirit_shroud_aa_ranks) {
++			auto *peer = zone->GetAlternateAdvancementRank(rank_id);
++			if (!peer || !peer->base_ability || peer->base_ability->category != AACategory::ShroudActive ||
++				peer->spell_type != rank->spell_type || !IsValidSpell(peer->spell) ||
++				!CanUseAlternateAdvancementRank(peer)) continue;
++			const int64 effective = int64(peer->recast_time) - GetAlternateAdvancementCooldownReduction(peer);
++			const int64 retain = std::max<int64>(peer->recast_time, effective);
++			timer_duration = int(std::max<int64>(timer_duration, std::min<int64>(retain, INT32_MAX)));
++		}
+ 	}
+ 
+ 	if (!IsCastWhileInvisibleSpell(rank->spell))
+@@ -1573,17 +1705,14 @@
  		return false;
  	}
  
@@ -555,7 +981,7 @@
  
  	//the one titanium hack i will allow
  	//just to make sure we dont crash the client with newer aas
-@@ -2039,6 +2123,8 @@
+@@ -2039,6 +2168,8 @@
  }
  
  void Client::ResetAlternateAdvancementRank(uint32 aa_id) {
@@ -564,7 +990,7 @@
  
  	/*
  		Resets your AA to baseline
-@@ -2059,6 +2145,8 @@
+@@ -2059,6 +2190,8 @@
  }
  
  void Client::TogglePurchaseAlternativeAdvancementRank(int rank_id){
@@ -573,7 +999,7 @@
  
  	/*
  		Stripped down version of purchasing AA. Will give no messages.
-@@ -2092,6 +2180,8 @@
+@@ -2092,6 +2225,8 @@
  }
  
  void Client::AutoGrantAAPoints() {
@@ -582,7 +1008,7 @@
  	int auto_grant_expansion = RuleI(Expansion, AutoGrantAAExpansion);
  
  	if (auto_grant_expansion == -1) {
-@@ -2161,6 +2251,8 @@
+@@ -2161,6 +2296,8 @@
  
  void Client::GrantAllAAPoints(uint8 unlock_level, bool skip_grant_only)
  {
@@ -608,22 +1034,45 @@
  	ac += itembonuses.AC; // items + food + tribute
  	int shield_ac = 0;
  	if (HasShieldEquipped() && IsOfClientBot()) {
-@@ -2048,7 +2050,14 @@
- 			} else {
- 				newexp -= exploss;
- 			}
-+			const auto before_loss = GetEXP();
- 			SetEXP(ExpSource::Death, newexp, GetAAXP());
-+			// A corpse may refund only an applied debit. The provisional shroud
-+			// XP path currently holds the original profile unchanged; advertising
-+			// an unapplied loss would mint normal XP after the shroud is removed.
-+			if (IsSpiritShrouded()) {
-+				exploss = before_loss > GetEXP() ? before_loss - GetEXP() : 0;
-+			}
- 			//m_epp.perAA = 0;	//reset to no AA exp on death.
- 		}
+@@ -1257,6 +1259,8 @@
  
-@@ -3496,6 +3505,12 @@
+ 		if (
+ 			!weapon_item->IsRaceEquipable(GetBaseRace()) &&
++			!(IsClient() && CastToClient()->IsSpiritShrouded() &&
++				CastToClient()->IsSpiritShroudStarterItem(weapon_item)) &&
+ 			(
+ 				!IsBot() ||
+ 				(IsBot() && !RuleB(Bots, AllowBotEquipAnyRaceGear))
+@@ -2004,7 +2008,7 @@
+ 		exploss *= zone->level_exp_mod[GetLevel()].ExpMod;
+ 	}
+ 
+-	if (exploss > 0 && RuleB(Character, DeathKeepLevel)) {
++	if (exploss > 0 && RuleB(Character, DeathKeepLevel) && !IsSpiritShrouded()) {
+ 		int32 total_exp = GetEXP();
+ 		uint32 level_min_exp = GetEXPForLevel(killed_level);
+ 		int32 level_exp = total_exp - level_min_exp;
+@@ -2040,7 +2044,9 @@
+ 	// now we apply the exp loss, unmem their spells, and make a corpse
+ 	// unless they're a GM (or less than lvl 10
+ 	if (!GetGM()) {
+-		if (exploss > 0) {
++		// Shrouded loss is applied to the original pending ledger only after
++		// a durable corpse identity exists; the temporary XP profile is fixed.
++		if (exploss > 0 && !IsSpiritShrouded()) {
+ 			int32 newexp = GetEXP();
+ 			if (exploss > newexp) {
+ 				//lost more than we have... wtf..
+@@ -2069,7 +2075,7 @@
+ 
+ 		if (
+ 			(RuleB(Character, LeaveCorpses) && GetLevel() >= RuleI(Character, DeathItemLossLevel)) ||
+-			RuleB(Character, LeaveNakedCorpses)
++			RuleB(Character, LeaveNakedCorpses) || IsSpiritShrouded()
+ 		) {
+ 			// creating the corpse takes the cash/items off the player too
+ 			new_corpse = new Corpse(this, exploss, killed_by);
+@@ -3496,6 +3502,12 @@
  
  int Mob::GetHandToHandDamage(void)
  {
@@ -636,7 +1085,7 @@
  	if (RuleB(Combat, UseRevampHandToHand)) {
  		// everyone uses this in the revamp!
  		int skill = GetSkill(EQ::skills::SkillHandtoHand);
-@@ -6690,8 +6705,10 @@
+@@ -6690,8 +6702,10 @@
  		int delay = 3500;
  
  		//if we have no weapon..
@@ -660,9 +1109,35 @@
  		if (item->ItemType != EQ::item::ItemTypeFood && item->ItemType != EQ::item::ItemTypeDrink) {
  			return;
  		}
+@@ -660,6 +660,15 @@
+ 		}
+ 
+ 		switch (effect) {
++		case SpellEffect::AttackSpeed:
++			// Captured Monster AA Attack Speed owns one cumulative raw factor.
++			// Keep this adapter out of every ordinary-character AA calculation.
++			if (IsClient() && CastToClient()->IsSpiritShrouded() &&
++				rank.base_ability && rank.base_ability->id == 49005 &&
++				limit_value == 0 && base_value >= 105 && base_value <= 140) {
++				newbon->haste += base_value;
++			}
++			break;
+ 		case SpellEffect::ACv2:
+ 		case SpellEffect::ArmorClass:
+ 			newbon->AC += base_value;
 --- a/zone/client.cpp
 +++ b/zone/client.cpp
-@@ -1018,6 +1018,7 @@
+@@ -783,7 +783,8 @@
+ 	// A rejected/unloaded ingress has authenticated IDs but does not own the
+ 	// existing actor's profile. Skip writer/callback lifecycle for that shell.
+ 	const bool owns_loaded_profile = !m_inventory_session_rejected &&
+-		(!RuleB(Housing, EnablePlayerHousing) || (ClientDataLoaded() && HasInventorySessionReservation()));
++		(!(RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs) || m_inventory_session_reservation) ||
++		 (ClientDataLoaded() && HasInventorySessionReservation()));
+ 	mMovementManager->RemoveClient(this);
+ 	if (!owns_loaded_profile && trade) trade->Reset(); // shell owns no real trade partner
+ 	if (owns_loaded_profile) {
+@@ -1018,6 +1019,7 @@
  
  bool Client::SaveAA()
  {
@@ -670,7 +1145,7 @@
  	if (m_fellowship_xp_persistence_failed || m_fellowship_xp_transaction_active) return false;
  	std::vector<CharacterAlternateAbilitiesRepository::CharacterAlternateAbilities> v;
  
-@@ -1048,7 +1049,11 @@
+@@ -1048,7 +1050,11 @@
  		}
  	}
  
@@ -683,7 +1158,7 @@
  
  	if (v.empty()) {
  		return true;
-@@ -1070,6 +1075,7 @@
+@@ -1070,10 +1076,12 @@
  }
  
  bool Client::Save(uint8 iCommitNow) {
@@ -691,7 +1166,13 @@
  	if (m_mercenary_persistence_failed) return false;
  	if (m_fellowship_xp_persistence_failed || m_fellowship_xp_transaction_active) return false;
  	if (m_inventory_session_rejected ||
-@@ -1303,6 +1309,7 @@
+-		(RuleB(Housing, EnablePlayerHousing) && !HasInventorySessionReservation())) return false;
++		((RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs) || m_inventory_session_reservation) &&
++		 !HasInventorySessionReservation())) return false;
+ 
+ 	if(!ClientDataLoaded())
+ 		return false;
+@@ -1303,6 +1311,7 @@
  	strn0cpy(message, orig_message, sizeof(message));
  
  	LogDebug("Client::ChannelMessageReceived() Channel:[{}] message:[{}]", chan_num, message);
@@ -699,7 +1180,7 @@
  
  	if (RuleB(Chat, AlwaysCaptureCommandText)) {
  		if (message[0] == COMMAND_CHAR) {
-@@ -5980,6 +5987,12 @@
+@@ -5980,6 +5989,12 @@
  
  void Client::SummonAndRezzAllCorpses()
  {
@@ -720,15 +1201,17 @@
  /* EQEMu: Everquest Server Emulator
  	Copyright (C) 2001-2003 EQEMu Development Team (http://eqemulator.org)
  
-@@ -19,6 +20,7 @@
+@@ -19,6 +20,9 @@
  #ifndef CLIENT_H
  #define CLIENT_H
  
 +namespace SpiritShroud { struct Template; }
++class ZoneDatabase;
++struct SpiritShroudDestination;
  class Client;
  class EQApplicationPacket;
  class DynamicZone;
-@@ -294,6 +296,34 @@
+@@ -294,6 +298,46 @@
  	void RejectInventorySessionAdmission() { m_inventory_session_rejected = true; }
  	bool HasInventorySessionReservation() const;
  	std::shared_ptr<Housing::InventorySessions::ZoneReservation> InventorySessionReleaseTicket() const;
@@ -736,6 +1219,15 @@
 +
 + const SpiritShroud::Template* SpiritShroudDefinition() const { return m_spirit_shroud_definition.get(); }
 + bool LoadSpiritShroudState();
++ bool LoadSpiritShroudRestoredShortBuffs();
++ std::unique_ptr<SpiritShroudDestination> PrepareSpiritShroudDestination(ZoneDatabase& transaction_db);
++ bool InstallSpiritShroudDestination(SpiritShroudDestination& destination);
++ void Handle_OP_SpiritShroudComplete(const EQApplicationPacket* packet);
++ bool ProcessSpiritShroudNativeTransition();
++ void BeginSpiritShroudNativeAcknowledgement(uint64_t revision);
++ bool RecordSpiritShroudDeath(uint32_t corpse_id, uint64_t requested_loss, uint64_t& applied_loss);
++ bool SettleSpiritShroudResurrection(uint32_t corpse_id, uint32_t spell_id, uint64_t offered_loss, bool& handled);
++ bool CanAcceptSpiritShroudResurrection(uint32_t corpse_id);
 + bool SpiritShroudTransitionPending() const { return m_spirit_shroud_transition; }
 + bool SaveSpiritShroudCheckpoint();
 + bool HasSpiritShroudRank(uint32_t rank) const;
@@ -746,6 +1238,9 @@
 + void PurchaseSpiritShroudRank(uint32_t rank_id, bool saved_set);
 + float SpiritShroudModelSize() const;
 + std::optional<uint32_t> SpiritShroudAbilityMinimumLevel(uint16_t spell_id, uint32_t rank_id) const;
++ bool SpiritShroudHasPersonalBank() const { return IsSpiritShrouded() && m_spirit_shroud_personal_bank; }
++ bool SettleSpiritShroudMercenaryFee(Merc* merc);
++ bool CanTransferSpiritShroudItemTree(const EQ::ItemInstance* item) const;
 + bool IsSpiritShrouded() const { return m_spirit_shroud_template != 0; }
 + bool TrySpiritShroudChat(const char*);
 + void OpenSpiritShrouds();
@@ -763,7 +1258,7 @@
  
  	~Client();
  
-@@ -522,11 +552,12 @@
+@@ -522,11 +566,12 @@
  	virtual bool Save() { return Save(0); }
  	bool Save(uint8 iCommitNow); // 0 = delayed, 1=async now, 2=sync now
  	inline void SaveCharacterData() {
@@ -777,7 +1272,7 @@
  	bool SaveAA();
  	void RemoveExpendedAA(int aa_id);
  
-@@ -801,10 +832,11 @@
+@@ -801,10 +846,11 @@
  	uint64 GetExperienceForKill(Mob *against);
  	void AddEXP(ExpSource exp_source, uint64 in_add_exp, uint8 conlevel = 0xFF, bool resexp = false, NPC* npc = nullptr);
  	uint64 CalcEXP(uint8 conlevel = 0xFF, bool ignore_mods = false);
@@ -791,7 +1286,7 @@
  	void SetEXP(ExpSource exp_source, uint64 set_exp, uint64 set_aaxp, bool resexp = false, NPC* npc = nullptr);
  	void AddLevelBasedExp(ExpSource exp_source, uint8 exp_percentage, uint8 max_level = 0, bool ignore_mods = false);
  	void SetLeadershipEXP(uint64 group_exp, uint64 raid_exp);
-@@ -1095,7 +1127,7 @@
+@@ -1095,7 +1141,7 @@
  	inline PTimerList &GetPTimers() { return(p_timers); }
  
  	//New AA Methods
@@ -800,15 +1295,37 @@
  	void SendAlternateAdvancementTable();
  	void SendAlternateAdvancementStats();
  	void PurchaseAlternateAdvancementRank(int rank_id);
-@@ -2125,6 +2157,13 @@
+@@ -1320,7 +1366,7 @@
+ 
+ 	//This is used to later set the buff duration of the spell, in slot to duration.
+ 	//Doesn't appear to work directly after the client recieves an action packet.
+-	void SendBuffDurationPacket(Buffs_Struct &buff, int slot);
++	void SendBuffDurationPacket(Buffs_Struct &buff, int slot, bool recreate = false);
+ 	void SendBuffNumHitPacket(Buffs_Struct &buff, int slot);
+ 
+ 	void ProcessInspectRequest(Client* requestee, Client* requester);
+@@ -2076,7 +2122,7 @@
+ 	eqFilterMode ClientFilters[_FilterCount];
+ 	int32 HandlePacket(const EQApplicationPacket *app);
+ 	void OPTGB(const EQApplicationPacket *app);
+-	void OPRezzAnswer(uint32 Action, uint32 SpellID, uint16 ZoneID, uint16 InstanceID, float x, float y, float z);
++	bool OPRezzAnswer(uint32 Action, uint32 SpellID, uint16 ZoneID, uint16 InstanceID, float x, float y, float z);
+ 	void OPMemorizeSpell(const EQApplicationPacket *app);
+ 	void OPMoveCoin(const EQApplicationPacket* app);
+ 	void MoveItemCharges(EQ::ItemInstance &from, int16 to_slot, uint8 type);
+@@ -2125,6 +2171,17 @@
  	uint8 playeraction;
  
  	bool m_inventory_session_rejected = false;
 + bool m_spirit_shroud_transition = false;
++ bool m_spirit_shroud_native_pending = false;
++ bool m_spirit_shroud_restored_short_buffs_pending = false;
++ uint64_t m_spirit_shroud_native_revision = 0, m_spirit_shroud_native_deadline = 0;
 + uint32_t m_spirit_shroud_template = 0, m_spirit_shroud_keeper = 0;
 + uint64_t m_spirit_shroud_menu_until = 0, m_spirit_shroud_progress_sent = 0;
 + std::set<uint32_t> m_spirit_shroud_aa_ranks;
 + uint64_t m_spirit_shroud_session_id = 0, m_spirit_shroud_revision = 0;
++ bool m_spirit_shroud_personal_bank = false;
 + std::shared_ptr<const SpiritShroud::Template> m_spirit_shroud_definition;
 + uint8_t m_spirit_shroud_resource_refreshes = 0;
  	std::shared_ptr<Housing::InventorySessions::ZoneReservation> m_inventory_session_reservation;
@@ -816,16 +1333,17 @@
  	std::shared_ptr<Housing::NativePlacement::Session> m_housing_placement_session;
 --- a/zone/client_mods.cpp
 +++ b/zone/client_mods.cpp
-@@ -23,6 +23,8 @@
+@@ -23,6 +23,9 @@
  #include "../common/spdat.h"
  
  #include "client.h"
 +#include "../common/shroud/native_stats.h"
 +#include "../common/shroud/resource_baseline.h"
++#include "../common/shroud/haste.h"
  #include "mob.h"
  
  #include "bot.h"
-@@ -239,7 +241,7 @@
+@@ -239,7 +242,7 @@
  	int64 base = 0;
  	auto base_data = zone->GetBaseData(GetLevel(), GetClass());
  	if (base_data.level == GetLevel()) {
@@ -834,7 +1352,7 @@
  	}
  
  	auto level = GetLevel();
-@@ -327,6 +329,8 @@
+@@ -327,6 +330,8 @@
  	max_hp = (float)max_hp * (float)nd / (float)10000; //this is to fix the HP-above-495k issue
  	max_hp += spellbonuses.FlatMaxHPChange + aabonuses.FlatMaxHPChange + itembonuses.FlatMaxHPChange;
  
@@ -843,7 +1361,7 @@
  	max_hp += GroupLeadershipAAHealthEnhancement();
  	if (current_hp > max_hp) {
  		current_hp = max_hp;
-@@ -481,7 +485,7 @@
+@@ -481,7 +486,7 @@
  
  int64 Client::CalcBaseHP()
  {
@@ -852,7 +1370,7 @@
  		int stats = GetSTA();
  		if (stats > 255) {
  			stats = (stats - 255) / 2;
-@@ -490,7 +494,13 @@
+@@ -490,7 +495,13 @@
  		base_hp = 5;
  		auto base_data = zone->GetBaseData(GetLevel(), GetClass());
  		if (base_data.level == GetLevel()) {
@@ -867,7 +1385,7 @@
  			base_hp += itembonuses.heroic_max_hp;
  		}
  	}
-@@ -568,7 +578,7 @@
+@@ -568,7 +579,7 @@
  	if (IsIntelligenceCasterClass()) {
  		WisInt = GetINT();
  
@@ -876,7 +1394,7 @@
  			ConvertedWisInt = WisInt;
  
  			int over200 = WisInt;
-@@ -581,7 +591,7 @@
+@@ -581,7 +592,7 @@
  
  			auto base_data = zone->GetBaseData(GetLevel(), GetClass());
  			if (base_data.level == GetLevel()) {
@@ -885,7 +1403,7 @@
  			}
  		} else {
  			if (((WisInt - 199) / 2) > 0) {
-@@ -601,7 +611,7 @@
+@@ -601,7 +612,7 @@
  	} else if (IsWisdomCasterClass()) {
  		WisInt = GetWIS();
  
@@ -894,7 +1412,7 @@
  			ConvertedWisInt = WisInt;
  
  			int over200 = WisInt;
-@@ -614,7 +624,7 @@
+@@ -614,7 +625,7 @@
  
  			auto base_data = zone->GetBaseData(GetLevel(), GetClass());
  			if (base_data.level == GetLevel()) {
@@ -903,7 +1421,7 @@
  			}
  		} else {
  			if (((WisInt - 199) / 2) > 0) {
-@@ -665,7 +675,10 @@
+@@ -665,7 +676,10 @@
  	// will get at least 1 for standing and 2 for sitting.
  	bool old = RuleB(Character, OldMinMana);
  	if (!IsStarved()) {
@@ -915,7 +1433,22 @@
  		if (IsSitting() || CanMedOnHorse()) {
  			// kind of weird to do it here w/e
  			// client does some base medding regen for shrouds here
-@@ -1068,6 +1081,9 @@
+@@ -930,6 +944,14 @@
+ 
+ int Client::CalcHaste()
+ {
++	// These captured shrouds have no item haste. Keep ordinary characters and
++	// any future unsupported item-haste loadout on the unchanged path below.
++	if (IsSpiritShrouded() && m_pp.shroud_native_resources_valid && aabonuses.haste > 0 && itembonuses.haste == 0) {
++		Haste = SpiritShroud::HasteFactorWithoutItems(GetLevel(), aabonuses.haste,
++			spellbonuses.haste, spellbonuses.hastetype2, spellbonuses.hastetype3,
++			spellbonuses.inhibitmelee, extra_haste);
++		return Haste;
++	}
+ 	/*  Tests: (based on results in newer char window)
+ 	    68 v1 + 46 item + 25 over + 35 inhib = 204%
+ 	    46 item + 5 v2 + 25 over + 35 inhib = 65%
+@@ -1068,6 +1090,9 @@
  		default:
  			MR = 20;
  	}
@@ -925,7 +1458,7 @@
  	MR += itembonuses.MR + spellbonuses.MR + aabonuses.MR;
  	if (GetClass() == Class::Warrior || GetClass() == Class::Berserker) {
  		MR += GetLevel() / 2;
-@@ -1142,6 +1158,9 @@
+@@ -1142,6 +1167,9 @@
  		default:
  			FR = 20;
  	}
@@ -935,7 +1468,7 @@
  	int c = GetClass();
  	if (c == Class::Ranger) {
  		FR += 4;
-@@ -1228,6 +1247,9 @@
+@@ -1228,6 +1256,9 @@
  		default:
  			DR = 15;
  	}
@@ -945,7 +1478,7 @@
  	int c = GetClass();
  	// the monk one is part of base resist
  	if (c == Class::Monk) {
-@@ -1320,6 +1342,9 @@
+@@ -1320,6 +1351,9 @@
  		default:
  			PR = 15;
  	}
@@ -955,7 +1488,7 @@
  	int c = GetClass();
  	// this monk bonus is part of the base
  	if (c == Class::Monk) {
-@@ -1412,6 +1437,9 @@
+@@ -1412,6 +1446,9 @@
  		default:
  			CR = 25;
  	}
@@ -965,7 +1498,7 @@
  	int c = GetClass();
  	if (c == Class::Ranger || c == Class::Beastlord) {
  		CR += 4;
-@@ -1432,7 +1460,7 @@
+@@ -1432,7 +1469,7 @@
  
  int32	Client::CalcCorrup()
  {
@@ -974,7 +1507,7 @@
  	if (Corrup > GetMaxCorrup()) {
  		Corrup = GetMaxCorrup();
  	}
-@@ -1441,7 +1469,7 @@
+@@ -1441,7 +1478,7 @@
  
  int32 Client::CalcATK()
  {
@@ -983,7 +1516,7 @@
  	return (ATK);
  }
  
-@@ -1622,18 +1650,23 @@
+@@ -1622,18 +1659,23 @@
  int64 Client::CalcBaseEndurance()
  {
  	int64 base_end = 0;
@@ -1016,7 +1549,7 @@
  		}
  	}
  	else {
-@@ -1670,7 +1703,7 @@
+@@ -1670,7 +1712,7 @@
  	if (!IsStarved()) {
  		auto base_data = zone->GetBaseData(GetLevel(), GetClass());
  		if (base_data.level == GetLevel()) {
@@ -1027,10 +1560,11 @@
  		}
 --- a/zone/client_packet.cpp
 +++ b/zone/client_packet.cpp
-@@ -102,6 +102,12 @@
+@@ -102,6 +102,13 @@
  	ConnectingOpcodes.clear();
  	memset(ConnectedOpcodes, 0, sizeof(ConnectedOpcodes));
  
++ ConnectedOpcodes[OP_SpiritShroudComplete]=&Client::Handle_OP_SpiritShroudComplete;
 + ConnectedOpcodes[OP_SpiritShroudRequest]=&Client::Handle_OP_SpiritShroudRequest;
 + ConnectedOpcodes[OP_SpiritShroudSelect]=&Client::Handle_OP_SpiritShroudSelect;
 + ConnectedOpcodes[OP_SpiritShroudCancel]=&Client::Handle_OP_SpiritShroudCancel;
@@ -1040,7 +1574,7 @@
  	// Now put all the opcodes into their home...
  	// connecting opcode handler assignments:
  	ConnectingOpcodes[OP_ApproveZone] = &Client::Handle_Connect_OP_ApproveZone;
-@@ -513,7 +519,34 @@
+@@ -513,7 +520,53 @@
  		(EQEmuLogSys::Instance()->IsLogEnabled(Logs::Detail, Logs::PacketClientServer) ? DumpPacketToString(app) : "")
  	);
  
@@ -1048,26 +1582,45 @@
 + EmuOpcode opcode = app->GetOpcode();
 + // A committed profile exchange leaves this old Client read-only until the
 + // same-zone transfer deletes it; only that transfer handshake may proceed.
-+ if(m_spirit_shroud_transition && opcode!=OP_ZoneChange && opcode!=OP_AckPacket && opcode!=OP_DeleteSpawn) return true;
-+ if(IsSpiritShrouded() && (opcode==OP_BankerChange || opcode==OP_Trader || opcode==OP_BazaarSearch || opcode==OP_AltCurrencyMerchantRequest)) return true;
-+ if(IsSpiritShrouded() && opcode==OP_MoveCoin)return true;
++ if(m_spirit_shroud_transition && !(opcode==OP_SpiritShroudComplete && m_spirit_shroud_native_pending) && opcode!=OP_ZoneChange && opcode!=OP_AckPacket && opcode!=OP_DeleteSpawn) return true;
++ if(IsSpiritShrouded() && (opcode==OP_Trader || opcode==OP_BazaarSearch || opcode==OP_AltCurrencyMerchantRequest)) return true;
++ if(IsSpiritShrouded() && opcode==OP_BankerChange && !SpiritShroudHasPersonalBank())return true;
++ if(IsSpiritShrouded() && opcode==OP_MoveCoin){
++  if(!SpiritShroudHasPersonalBank() || app->size!=sizeof(MoveCoin_Struct))return true;
++  auto* coin=reinterpret_cast<const MoveCoin_Struct*>(app->pBuffer);
++  // Only live carried/cursor/personal-bank/trade wallets are available.
++  // Shared-bank coin remains inaccessible even when a packet is forged.
++  if(coin->from_slot<0 || coin->from_slot>3 || coin->to_slot<0 || coin->to_slot>3)return true;
++ }
 + // Temporary equipment must remain in this profile until restoration. Broader
 + // trading and crafting support will require explicit transfer provenance.
-+ if(IsSpiritShrouded() && (opcode==OP_TradeRequest || opcode==OP_TradeRequestAck ||
-+    opcode==OP_TradeAcceptClick || opcode==OP_ShopPlayerSell || opcode==OP_GroundSpawn ||
++ if(IsSpiritShrouded() && (opcode==OP_GroundSpawn ||
 +    opcode==OP_GuildBank || opcode==OP_TradeSkillCombine || opcode==OP_RecipeAutoCombine ||
 +    opcode==OP_AugmentItem || opcode==OP_TributeItem || opcode==OP_GuildTributeDonateItem ||
 +    opcode==OP_ShopSendParcel || opcode==OP_AltCurrencySell || opcode==OP_AltCurrencyReclaim))return true;
-+ if(IsSpiritShrouded() && std::string(OpcodeManager::EmuToName(opcode)).rfind("OP_Mercenary",0)==0)return true;
++
++ if(IsSpiritShrouded() && opcode==OP_MoveMultipleItems){
++  if(app->size<sizeof(MultiMoveItem_Struct))return true;
++  auto* moves=reinterpret_cast<const MultiMoveItem_Struct*>(app->pBuffer);
++  if(!moves->count || moves->count>100 || app->size!=sizeof(MultiMoveItem_Struct)+sizeof(MultiMoveItemSub_Struct)*moves->count)return true;
++  for(uint32 i=0;i<moves->count;++i){
++   // Bank transfers use the guarded single-item operation. The native bulk
++   // rearrangement implementation has direct writes outside SwapItem.
++   if(moves->moves[i].from_slot.Type!=EQ::invtype::typePossessions ||
++      moves->moves[i].to_slot.Type!=EQ::invtype::typePossessions)return true;
++   if(moves->moves[i].from_slot.Slot<EQ::invslot::GENERAL_BEGIN || moves->moves[i].from_slot.Slot>EQ::invslot::slotCursor ||
++      moves->moves[i].to_slot.Slot<EQ::invslot::GENERAL_BEGIN || moves->moves[i].to_slot.Slot>EQ::invslot::slotCursor)return true;
++  }
++ }
 + if(IsSpiritShrouded() && (opcode==OP_MoveItem || opcode==OP_DeleteItem || opcode==OP_DeleteCharge) && app->size==sizeof(MoveItem_Struct)) {
 +  auto* move=reinterpret_cast<const MoveItem_Struct*>(app->pBuffer);
-+  const auto held_bank=[](uint32_t slot){return
-+   (slot>=EQ::invslot::BANK_BEGIN && slot<=EQ::invslot::BANK_END) ||
++  const auto held_bank=[this](uint32_t slot){return
 +   (slot>=EQ::invslot::SHARED_BANK_BEGIN && slot<=EQ::invslot::SHARED_BANK_END) ||
-+   (slot>=EQ::invbag::BANK_BAGS_BEGIN && slot<=EQ::invbag::SHARED_BANK_BAGS_END);};
++   (slot>=EQ::invbag::SHARED_BANK_BAGS_BEGIN && slot<=EQ::invbag::SHARED_BANK_BAGS_END) ||
++   (!SpiritShroudHasPersonalBank() && ((slot>=EQ::invslot::BANK_BEGIN && slot<=EQ::invslot::BANK_END) ||
++    (slot>=EQ::invbag::BANK_BAGS_BEGIN && slot<=EQ::invbag::BANK_BAGS_END)));};
 +  if(held_bank(move->from_slot)||held_bank(move->to_slot))return true;
 +  const auto external=[](uint32_t slot){return
-+   (slot>=EQ::invslot::TRADE_BEGIN && slot<=EQ::invslot::TRADE_END) ||
 +   (slot>=EQ::invslot::WORLD_BEGIN && slot<=EQ::invslot::WORLD_END);};
 +  if(external(move->from_slot)||external(move->to_slot))return true;
 + }
@@ -1076,7 +1629,7 @@
  	if (opcode == OP_AckPacket) {
  		return true;
  	}
-@@ -587,6 +620,14 @@
+@@ -587,6 +640,14 @@
  	SetDueling(false);
  
  	EnteringMessages(this);
@@ -1091,7 +1644,28 @@
  	LoadPEQZoneFlags();
  	LoadZoneFlags();
  	LoadAccountFlags();
-@@ -1131,7 +1172,14 @@
+@@ -1002,6 +1063,20 @@
+ 		delete pack;
+ 	}
+ 
++	// Ordinary profiles contain only long affects. Recreate only Song slots
++	// installed by the scoped restoration loader, once the login profile exists.
++	if (m_spirit_shroud_restored_short_buffs_pending) {
++		m_spirit_shroud_restored_short_buffs_pending = false;
++		if (ClientVersion() == EQ::versions::ClientVersion::RoF2 && !IsSpiritShrouded()) {
++			const int end = GetMaxBuffSlots() + GetMaxSongSlots();
++			for (int slot = GetMaxBuffSlots(); slot < end; ++slot) {
++				if (IsValidSpell(buffs[slot].spellid) && spells[buffs[slot].spellid].short_buff_box) {
++					SendBuffDurationPacket(buffs[slot], slot, true);
++				}
++			}
++		}
++	}
++
+ 	if (IsClient() && CastToClient()->ClientVersionBit() & EQ::versions::maskUFAndLater) {
+ 		EQApplicationPacket *outapp = MakeBuffsPacket(false);
+ 		CastToClient()->FastQueuePacket(&outapp);
+@@ -1131,7 +1206,14 @@
  	if (!Spawned())
  		SendZoneInPackets();
  	CompleteConnect();
@@ -1107,7 +1681,63 @@
  }
  
  void Client::Handle_Connect_OP_ClientUpdate(const EQApplicationPacket *app)
-@@ -1476,6 +1524,7 @@
+@@ -1338,7 +1420,7 @@
+ 	Client* client = entity_list.GetClientByName(cze->char_name);
+ 	if (!zone->GetAuth(ip, cze->char_name, &WID, &account_id, &character_id, &admin, lskey, &tellsoff)) {
+ 		LogClientLogin("[{}] failed zone auth check", cze->char_name);
+-		if (RuleB(Housing, EnablePlayerHousing)) {
++		if (RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs)) {
+ 			RejectInventorySessionAdmission();
+ 			Disconnect();
+ 			return; // unclaimed ingress must not save/kick a real reservation owner
+@@ -1353,7 +1435,8 @@
+ 
+ 	// Trusted zone auth has resolved character/account. Reject before antighost
+ 	// saves or inventory load can touch a character with unresolved custody.
+-	if (Housing::CheckInventoryAdmission(database, CharacterID(), RuleB(Housing, EnablePlayerHousing)) !=
++	if (Housing::CheckInventoryAdmission(database, CharacterID(),
++		RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs)) !=
+ 		Housing::InventoryAdmission::Allowed) {
+ 		LogWarning("Character [{}] zone admission blocked by unresolved/unavailable housing custody state", CharacterID());
+ 		RejectInventorySessionAdmission();
+@@ -1361,9 +1444,9 @@
+ 		return;
+ 	}
+ 
+-	// Every enabled client version must win durable per-character ownership
+-	// before antighost callbacks or any profile/inventory loading can occur.
+-	if (RuleB(Housing, EnablePlayerHousing) && !ClaimInventorySessionReservation()) {
++	// Mercenary coin payments share this ownership fence even when housing
++	// gameplay is disabled. Claim before antighost callbacks or profile loading.
++	if ((RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs)) && !ClaimInventorySessionReservation()) {
+ 		LogWarning("Character [{}] inventory-session admission unavailable or already owned", CharacterID());
+ 		RejectInventorySessionAdmission();
+ 		Disconnect();
+@@ -1453,19 +1536,20 @@
+ 	m_inv.SetGMInventory(true);
+ 	// Recheck already-issued ingress authorization just before GetInventory,
+ 	// which rewrites runtime GUID metadata. No timeout lease takeover.
+-	if (Housing::CheckCustodyAdmission(database, CharacterID(), RuleB(Housing, EnablePlayerHousing)) !=
++	if (Housing::CheckCustodyAdmission(database, CharacterID(),
++		RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs) || bool(InventorySessionReleaseTicket())) !=
+ 		Housing::InventoryAdmission::Allowed) {
+ 		RejectInventorySessionAdmission();
+ 		Disconnect();
+ 		return;
+ 	}
+-	if (RuleB(Housing, EnablePlayerHousing) && !HasInventorySessionReservation()) {
++	if ((RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs) || InventorySessionReleaseTicket()) && !HasInventorySessionReservation()) {
+ 		RejectInventorySessionAdmission();
+ 		Disconnect();
+ 		return;
+ 	}
+ 	loaditems = Housing::HousePreload::LoadInventoryWithHouseBindings(*this,database,RuleB(Housing,EnablePlayerHousing));
+-	if (RuleB(Housing, EnablePlayerHousing) && !loaditems) {
++	if ((RuleB(Housing, EnablePlayerHousing) || RuleB(Mercs, AllowMercs) || InventorySessionReleaseTicket()) && !loaditems) {
+ 		RejectInventorySessionAdmission();
+ 		Disconnect();
+ 		return;
+@@ -1476,6 +1560,7 @@
  	database.LoadCharacterPotionBelt(cid, &m_pp); /* Load Character Potion Belt */
  	database.LoadCharacterCurrency(cid, &m_pp); /* Load Character Currency into PP */
  	database.LoadCharacterData(cid, &m_pp, &m_epp); /* Load Character Data from DB into PP as well as E_PP */
@@ -1115,7 +1745,7 @@
  	database.LoadCharacterSkills(cid, &m_pp); /* Load Character Skills */
  	database.LoadCharacterInspectMessage(cid, &m_inspect_message); /* Load Character Inspect Message */
  	database.LoadCharacterSpellBook(cid, &m_pp); /* Load Character Spell Book */
-@@ -1638,6 +1687,9 @@
+@@ -1638,6 +1723,9 @@
  		size = 0;
  	}
  
@@ -1125,7 +1755,15 @@
  	/* Check for Invalid points */
  	if (m_pp.ldon_points_guk < 0 || m_pp.ldon_points_guk > 2000000000) { m_pp.ldon_points_guk = 0; }
  	if (m_pp.ldon_points_mir < 0 || m_pp.ldon_points_mir > 2000000000) { m_pp.ldon_points_mir = 0; }
-@@ -1828,6 +1880,23 @@
+@@ -1664,6 +1752,7 @@
+ 		}
+ 
+ 		database.LoadBuffs(this);
++		if (!LoadSpiritShroudRestoredShortBuffs()) return;
+ 		uint32 max_slots = GetMaxBuffSlots();
+ 		for (int i = 0; i < BUFF_COUNT; i++) {
+ 			if (IsValidSpell(buffs[i].spellid)) {
+@@ -1828,6 +1917,23 @@
  	/* The entityid field in the Player Profile is used by the Client in relation to Group Leadership AA */
  	m_pp.entityid = GetID();
  	memcpy(outapp->pBuffer, &m_pp, outapp->size);
@@ -1149,7 +1787,7 @@
  	outapp->priority = 6;
  	FastQueuePacket(&outapp);
  
-@@ -2015,6 +2084,7 @@
+@@ -2015,6 +2121,7 @@
  		return;
  	}
  	AA_Action* action = (AA_Action*)app->pBuffer;
@@ -1157,23 +1795,50 @@
  
  	if (action->action == aaActionActivate) {//AA Hotkey
  		LogAA("Activating AA [{}]", action->ability);
-@@ -13920,6 +13990,13 @@
+@@ -13920,8 +14027,11 @@
  void Client::Handle_OP_RezzAnswer(const EQApplicationPacket *app)
  {
  	VERIFY_PACKET_LENGTH(OP_RezzAnswer, app, Resurrect_Struct);
-+ // Until corpse-domain settlement is verified, preserve the offer rather than
-+ // marking a normal corpse resurrected while temporary-profile SetEXP drops it.
-+ if(IsSpiritShrouded()){
-+  Message(Chat::Yellow,"Remove your shroud before accepting this resurrection.");
+-
+-	const auto* r = (const Resurrect_Struct*) app->pBuffer;
++ const auto* r = reinterpret_cast<const Resurrect_Struct*>(app->pBuffer);
++ if (r->action == ResurrectionActions::Accept && !CanAcceptSpiritShroudResurrection(PendingRezzDBID)) {
++  Message(Chat::Yellow, "Remove your shroud before accepting this original-character resurrection.");
 +  return;
 + }
-+
  
- 	const auto* r = (const Resurrect_Struct*) app->pBuffer;
+ 	LogSpells(
+ 		"[Client::Handle_OP_RezzAnswer] Received OP_RezzAnswer from client. Pendingrezzexp is [{}] action is [{}]",
+@@ -13930,7 +14040,7 @@
+ 	);
  
+ 
+-	OPRezzAnswer(r->action, r->spellid, r->zone_id, r->instance_id, r->x, r->y, r->z);
++	if (!OPRezzAnswer(r->action, r->spellid, r->zone_id, r->instance_id, r->x, r->y, r->z)) return;
+ 
+ 	if (r->action == ResurrectionActions::Accept) {
+ 		if (PlayerEventLogs::Instance()->IsEventEnabled(PlayerEvent::REZ_ACCEPTED)) {
+@@ -14628,6 +14738,9 @@
+ 	if (!item || !inst) {
+ 		Message(Chat::Red, "You seemed to have misplaced that item..");
+ 		return;
++	}
++	if(!CanTransferSpiritShroudItemTree(inst)){
++		Message(Chat::Yellow,"Your shroud's temporary supplies cannot be sold.");return;
+ 	}
+ 	if (mp->quantity > 1)
+ 	{
 --- a/zone/client_process.cpp
 +++ b/zone/client_process.cpp
-@@ -117,7 +117,13 @@
+@@ -61,6 +61,7 @@
+ extern EntityList entity_list;
+ 
+ bool Client::Process() {
++ if (!ProcessSpiritShroudNativeTransition()) return false;
+ 	bool ret = true;
+ 
+ 	if (Connected() || IsLD()) {
+@@ -117,7 +118,13 @@
  		// SendHPUpdate calls hpupdate_timer.Start so it can delay this timer, so lets not reset with the check
  		// since the function will anyways
  		if (hpupdate_timer.Check(false)) {
@@ -1188,31 +1853,103 @@
  		}
  
  		/* I haven't naturally updated my position in 10 seconds, updating manually */
-@@ -1055,6 +1061,8 @@
+@@ -1053,20 +1060,23 @@
+ 	return 0;
+ }
  
- void Client::OPRezzAnswer(uint32 Action, uint32 SpellID, uint16 ZoneID, uint16 InstanceID, float x, float y, float z)
+-void Client::OPRezzAnswer(uint32 Action, uint32 SpellID, uint16 ZoneID, uint16 InstanceID, float x, float y, float z)
++bool Client::OPRezzAnswer(uint32 Action, uint32 SpellID, uint16 ZoneID, uint16 InstanceID, float x, float y, float z)
  {
-+ if(IsSpiritShrouded())return; // Do not consume a cross-profile resurrection claim.
 +
  	if(PendingRezzXP < 0) {
  		// pendingrezexp is set to -1 if we are not expecting an OP_RezzAnswer
  		LogSpells("Unexpected OP_RezzAnswer. Ignoring it");
+ 		Message(Chat::Red, "You have already been resurrected.\n");
+-		return;
++		return false;
+ 	}
+ 
+ 	if (Action == 1)
+ 	{
++		bool managed = false;
++		if (!IsValidSpell(SpellID) || !SettleSpiritShroudResurrection(PendingRezzDBID, SpellID, PendingRezzXP, managed)) return false;
+ 		// Mark the corpse as rezzed in the database, just in case the corpse has buried, or the zone the
+ 		// corpse is in has shutdown since the rez spell was cast.
+-		database.MarkCorpseAsResurrected(PendingRezzDBID);
++		if (!managed) database.MarkCorpseAsResurrected(PendingRezzDBID);
+ 		LogSpells("Player [{}] got a [{}] Rezz spellid [{}] in zone[{}] instance id [{}]",
+ 				name, (uint16)spells[SpellID].base_value[0],
+ 				SpellID, ZoneID, InstanceID);
+@@ -1132,9 +1142,9 @@
+ 			SetEndurance(GetMaxEndurance() / 20);
+ 		}
+ 
+-		if(spells[SpellID].base_value[0] < 100 && spells[SpellID].base_value[0] > 0 && PendingRezzXP > 0) {
++		if(!managed && spells[SpellID].base_value[0] < 100 && spells[SpellID].base_value[0] > 0 && PendingRezzXP > 0) {
+ 			SetEXP(ExpSource::Resurrection, ((int)(GetEXP()+((float)((PendingRezzXP / 100) * spells[SpellID].base_value[0])))), GetAAXP(), true);
+-		} else if (spells[SpellID].base_value[0] == 100 && PendingRezzXP > 0) {
++		} else if (!managed && spells[SpellID].base_value[0] == 100 && PendingRezzXP > 0) {
+ 			SetEXP(ExpSource::Resurrection, (GetEXP() + PendingRezzXP), GetAAXP(), true);
+ 		}
+ 
+@@ -1145,6 +1155,7 @@
+ 	}
+ 	PendingRezzXP = -1;
+ 	PendingRezzSpellID = 0;
++	return true;
+ }
+ 
+ void Client::OPTGB(const EQApplicationPacket *app)
+@@ -2147,6 +2158,23 @@
+ 
+ void Client::HandleRespawnFromHover(uint32 Option)
+ {
++ // Validate and settle before changing HP, position, hover state or corpse.
++ // An invalid cross-profile offer must leave the bind choice available.
++ if (respawn_options.size() > 1 && Option != 0 && Option == respawn_options.size()-1) {
++  bool managed = false;
++  if (PendingRezzXP < 0 || !IsValidSpell(PendingRezzSpellID) ||
++      !SettleSpiritShroudResurrection(PendingRezzDBID, PendingRezzSpellID, PendingRezzXP, managed)) {
++   Message(Chat::Yellow, "This resurrection cannot be accepted in your current form. You may still respawn at your bind.");
++   auto saved = respawn_options;
++   const auto selection = initial_respawn_selection;
++   respawn_options.pop_back(); // SendRespawnBinds adds its own trailing rez row.
++   initial_respawn_selection = 0;
++   SendRespawnBinds();
++   respawn_options.swap(saved);
++   initial_respawn_selection = selection;
++   return;
++  }
++ }
+ 	RespawnFromHoverTimer.Disable();
+ 
+ 	RespawnOption* chosen = nullptr;
+@@ -2231,7 +2259,7 @@
+ 
+ 			ClearHover();
+ 			SendHPUpdate();
+-			OPRezzAnswer(1, PendingRezzSpellID, zone->GetZoneID(), zone->GetInstanceID(), GetX(), GetY(), GetZ());
++			if (!OPRezzAnswer(1, PendingRezzSpellID, zone->GetZoneID(), zone->GetInstanceID(), GetX(), GetY(), GetZ())) return;
+ 
+ 			if (corpse && corpse->IsCorpse())
+ 			{
 --- a/zone/corpse.cpp
 +++ b/zone/corpse.cpp
-@@ -268,7 +268,11 @@
+@@ -268,7 +268,12 @@
  	m_consented_guild_id = c->AutoConsentGuildEnabled() ? c->GuildID() : 0;
  
  	m_is_corpse_changed         = true;
 -	m_rezzed_experience         = rez_exp;
-+	// Temporary forms retain their possessions on death until session-aware
-+	// corpse custody is implemented. A corpse must not later return starter
++	// Temporary forms retain their possessions on death under the explicit
++	// escrow-safe inventory policy. A corpse must not later return starter
 +	// equipment into the restored original profile or strand earned bag children.
 +	const bool keep_shroud_possessions = c->IsSpiritShrouded();
++	if (keep_shroud_possessions) m_EntityVariables["spirit_shroud_corpse"] = "1";
 +	m_rezzed_experience         = keep_shroud_possessions ? 0 : rez_exp;
  	m_is_player_corpse          = true;
  	m_is_locked                 = false;
  	m_being_looted_by_entity_id = 0xFFFFFFFF;
-@@ -307,6 +311,7 @@
+@@ -307,6 +312,7 @@
  
  	/* Check Rule to see if we can leave corpses */
  	if (
@@ -1220,6 +1957,55 @@
  		(!RuleB(Character, LeaveNakedCorpses) || RuleB(Character, LeaveCorpses)) &&
  		GetLevel() >= RuleI(Character, DeathItemLossLevel)
  		) {
+@@ -409,6 +415,16 @@
+ 
+ 	IsRezzed(false);
+ 	Save();
++	if (keep_shroud_possessions) {
++		uint64_t applied_loss = 0;
++		if (!m_corpse_db_id || !c->RecordSpiritShroudDeath(m_corpse_db_id, rez_exp, applied_loss)) {
++			// The zero-XP corpse was saved before the debit. If accounting or
++			// commit status is uncertain, reconnect reconstructs committed state.
++			c->Disconnect();
++			return;
++		}
++		m_rezzed_experience = static_cast<uint32_t>(applied_loss);
++	}
+ }
+ 
+ void Corpse::MoveItemToCorpse(Client *client, EQ::ItemInstance *inst, int16 equipSlot, std::list<uint32> &removedList)
+@@ -645,6 +661,31 @@
+ 		return true;
+ 	}
+ 
++ // A single joined UPDATE makes the persisted claim authoritative even if a
++ // different zone accepts resurrection concurrently with this stale instance.
++ if (m_corpse_db_id && m_EntityVariables.count("spirit_shroud_corpse")) {
++  if (!m_item_list.empty() || m_copper || m_silver || m_gold || m_platinum) return false;
++  const auto id = std::to_string(m_corpse_db_id), owner = std::to_string(m_character_id);
++  const auto update = database.QueryDatabase(fmt::format(
++   "UPDATE character_corpses c JOIN spirit_shroud_corpse_state p ON p.corpse_id=c.id AND p.character_id=c.charid "
++   "SET c.zone_id={0},c.instance_id={1},c.x={2},c.y={3},c.z={4},c.heading={5},c.guild_consent_id={6},c.is_locked={7},"
++   "c.exp=IF(p.rez_claimed_at IS NULL AND c.rezzable=1 AND c.is_rezzed=0 AND {8}=1 AND {9}=0,p.applied_loss,0),"
++   "c.is_rezzed=IF(p.rez_claimed_at IS NOT NULL OR c.rezzable=0 OR {8}=0 OR {9}=1,1,c.is_rezzed),"
++   "c.rez_time=IF(c.rezzable=0 OR {8}=0,0,LEAST(c.rez_time,{10})),c.rezzable=LEAST(c.rezzable,{8}) "
++   "WHERE c.id={11} AND c.charid={12} AND p.provenance_version=1 AND p.applied_loss<=2147483647",
++   zone->GetZoneID(),zone->GetInstanceID(),GetX(),GetY(),GetZ(),GetHeading(),m_consented_guild_id,m_is_locked?1:0,
++   m_is_rezzable?1:0,IsRezzed()?1:0,m_remaining_rez_time,m_corpse_db_id,m_character_id));
++  if (!update.Success()) return false;
++  auto state = database.QueryDatabase("SELECT c.exp,c.is_rezzed,c.rezzable,c.rez_time FROM spirit_shroud_corpse_state p JOIN character_corpses c ON c.id=p.corpse_id AND c.charid=p.character_id WHERE p.corpse_id="+id+" AND p.character_id="+owner+" AND p.provenance_version=1 AND p.applied_loss<=2147483647");
++  if (!state.Success() || state.RowCount()!=1) return false;
++  m_rezzed_experience=Strings::ToUnsignedInt(state.begin()[0]);
++  if (Strings::ToUnsignedInt(state.begin()[1])) IsRezzed(true);
++  m_is_rezzable=Strings::ToUnsignedInt(state.begin()[2])!=0;
++  m_remaining_rez_time=Strings::ToUnsignedInt(state.begin()[3]);
++  if (!m_is_rezzable) m_corpse_rezzable_timer.Disable();
++  return true;
++ }
++
+ 	CharacterCorpseEntry ce;
+ 
+ 	ce.size             = size;
 --- a/zone/exp.cpp
 +++ b/zone/exp.cpp
 @@ -245,7 +245,7 @@
@@ -1326,7 +2112,58 @@
  	LogInventory(
  		"[{}] (char_id: [{}]) Attempting to drop item from slot [{}] on the ground",
  		GetCleanName(),
-@@ -2106,7 +2108,13 @@
+@@ -1600,8 +1602,50 @@
+ 
+ // Moves items around both internally and in the database
+ // In the future, this can be optimized by pushing all changes through one database REPLACE call
++// A container is one custody tree: a starter nested anywhere in it must never
++// leave the temporary profile through a trade, merchant, or bank transfer.
++bool Client::CanTransferSpiritShroudItemTree(const EQ::ItemInstance* item) const {
++ if(!IsSpiritShrouded())return true;
++ unsigned remaining=256;
++ const auto inspect=[&](const auto& self,const EQ::ItemInstance* node,unsigned depth)->bool {
++  if(!node)return true;
++  if(!remaining-- || depth>10)return false;
++  const auto metadata=node->GetCustomDataString();
++  if(metadata.find("spirit_shroud_starter_session")!=std::string::npos ||
++     metadata.find("spirit_shroud_starter_token")!=std::string::npos)return false;
++  if(node->IsClassBag())for(unsigned i=0;i<EQ::invbag::SLOT_COUNT;++i)if(!self(self,node->GetItem(i),depth+1))return false;
++  for(unsigned i=0;i<6;++i)if(!self(self,node->GetAugment(i),depth+1))return false;
++  return true;
++ };
++ return inspect(inspect,item,0);
++}
++
+ bool Client::SwapItem(MoveItem_Struct* move_in) {
+ 	if (!move_in) return false;
++	// Apply custody checks at the inventory operation as well as packet dispatch:
++	// multi-move and quest callers must not bypass the shroud's escrow domain.
++	if (IsSpiritShrouded()) {
++		const auto bank=[](uint32 slot){return
++			(slot>=EQ::invslot::BANK_BEGIN && slot<=EQ::invslot::BANK_END) ||
++			(slot>=EQ::invbag::BANK_BAGS_BEGIN && slot<=EQ::invbag::BANK_BAGS_END);};
++		const auto forbidden=[&](uint32 slot){return
++			(slot>=EQ::invslot::SHARED_BANK_BEGIN && slot<=EQ::invslot::SHARED_BANK_END) ||
++			(slot>=EQ::invbag::SHARED_BANK_BAGS_BEGIN && slot<=EQ::invbag::SHARED_BANK_BAGS_END) ||
++			(!SpiritShroudHasPersonalBank() && bank(slot));};
++		if (forbidden(move_in->from_slot) || forbidden(move_in->to_slot)) return false;
++		const auto* source=m_inv.GetItem(move_in->from_slot);
++		const auto* destination=m_inv.GetItem(move_in->to_slot);
++		const auto starter=[this](const EQ::ItemInstance* item){return !CanTransferSpiritShroudItemTree(item);};
++		// Issued supplies must be reclaimed at restoration, not left in the bank.
++		if ((bank(move_in->to_slot) && starter(source)) || (bank(move_in->from_slot) && starter(destination))) return false;
++		const auto external=[](uint32 slot){return slot>=EQ::invslot::TRADE_BEGIN && slot<=EQ::invslot::TRADE_END;};
++		if((external(move_in->to_slot) && starter(source)) || (external(move_in->from_slot) && starter(destination))) return false;
++		// Earned gear may be carried but must never become an active weapon or
++		// worn effect through a monster race wildcard in ordinary equipability.
++		const auto equipment=[](uint32 slot){return slot>=EQ::invslot::EQUIPMENT_BEGIN && slot<=EQ::invslot::EQUIPMENT_END;};
++		if ((source && equipment(move_in->to_slot) && !IsSpiritShroudStarterItem(source)) ||
++			(destination && equipment(move_in->from_slot) && !IsSpiritShroudStarterItem(destination))) return false;
++	}
+ 	const auto house_swap = Housing::HouseInventory::TryZoneSwap(*this, move_in->from_slot, move_in->to_slot, move_in->number_in_stack);
+ 	if (house_swap == Housing::HouseInventory::SwapDisposition::Rejected) return false;
+ 	if (house_swap == Housing::HouseInventory::SwapDisposition::Moved) {
+@@ -2106,7 +2150,13 @@
  		}
  
  		EQ::InventoryProfile::SwapItemFailState fail_state = EQ::InventoryProfile::swapInvalid;
@@ -1341,6 +2178,122 @@
  			const char* fail_message = "The selected slot was invalid.";
  			if (fail_state == EQ::InventoryProfile::swapRaceClass || fail_state == EQ::InventoryProfile::swapDeity)
  				fail_message = "Your class, deity and/or race may not equip that item.";
+--- a/zone/merc.cpp
++++ b/zone/merc.cpp
+@@ -1,4 +1,6 @@
+ #include "../common/mercenary/rof2_timer.h"
++#include "mercenary_transaction.h"
++#include "inventory_session_owner.h"
+ 
+ #include "merc.h"
+ #include "client.h"
+@@ -5001,6 +5003,11 @@
+ 
+ bool Client::CheckCanHireMerc(Mob* merchant, uint32 template_id) {
+ 
++	if(IsSpiritShrouded() && !m_spirit_shroud_session_id){
++		Message(Chat::Yellow,"Remove and select your shroud again before hiring a mercenary.");
++		return false;
++	}
++
+ 	if (!CheckCanSpawnMerc(template_id))
+ 	{
+ 		return false;
+@@ -5451,6 +5458,49 @@
+ 	return false;
+ }
+ 
++// A shroud hire is repriced once at the original level. Payment is a separate
++// durable liability: a failed group join after paying cannot charge it twice.
++// Restoration itself never depends on the ability to afford this fee.
++bool Client::SettleSpiritShroudMercenaryFee(Merc* merc) {
++ if(!merc || merc->GetMercenaryOwner()!=this)return false;
++ if(!merc->GetMercenaryID())return true;
++ auto schema=database.QueryDatabase(std::string("SELECT engine FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='spirit_shroud_mercenary_fees'"),false);
++ if(!schema.Success())return false;
++ if(!schema.RowCount())return true; // Server without the optional shroud storage.
++ if(schema.RowCount()!=1 || !schema.begin()[0] || std::string(schema.begin()[0])!="InnoDB")return false;
++ auto due=database.QueryDatabase(fmt::format("SELECT session_id,fee_copper FROM spirit_shroud_mercenary_fees WHERE merc_id={} AND character_id={} AND template_id={} AND paid_at IS NULL",merc->GetMercenaryID(),CharacterID(),merc->GetMercenaryTemplateID()),false);
++ if(!due.Success())return false;
++ if(!due.RowCount())return true;
++ if(due.RowCount()!=1 || !due.begin()[0] || !due.begin()[1])return false;
++ const uint64 session=std::stoull(due.begin()[0]),fee=std::stoull(due.begin()[1]);
++ if(IsSpiritShrouded()){
++  if(session==m_spirit_shroud_session_id)return true;
++  Message(Chat::Yellow,"Remove your shroud and settle your mercenary's earlier hire fee before using it again.");return false;
++ }
++ Mercenary::Payment payment;
++ if(!PrepareMercenaryPayment(payment,fee)){
++  Message(Chat::Yellow,"Your mercenary remains suspended until you can pay its original-level hire fee (%llu copper).",static_cast<unsigned long long>(fee));
++  return false;
++ }
++ const auto guard=payment.guard;
++ payment.guard=[this,merc,session,fee,guard](Database& db,uint64 connection){
++  if(IsSpiritShrouded() || !guard(db,connection))return false;
++  auto row=db.QueryDatabase(fmt::format("SELECT session_id,fee_copper FROM spirit_shroud_mercenary_fees WHERE merc_id={} AND character_id={} AND template_id={} AND paid_at IS NULL FOR UPDATE",merc->GetMercenaryID(),CharacterID(),merc->GetMercenaryTemplateID()),false);
++  if(!row.Success() || row.RowCount()!=1 || !row.begin()[0] || !row.begin()[1] || std::stoull(row.begin()[0])!=session || std::stoull(row.begin()[1])!=fee)return false;
++  auto paid=db.QueryDatabase(fmt::format("UPDATE spirit_shroud_mercenary_fees SET paid_at={} WHERE merc_id={} AND character_id={} AND paid_at IS NULL",uint64(time(nullptr)),merc->GetMercenaryID(),CharacterID()),false);
++  return paid.Success() && paid.RowsAffected()==1;
++ };
++ const auto ticket=InventorySessionReleaseTicket();
++ if(database.SaveMercenaryAtomic(merc,&payment)!=Mercenary::SaveResult::Saved){RejectMercenaryPersistence();return false;}
++ if(!ticket || ticket!=InventorySessionReleaseTicket() || !ticket->HeldFor(*this) ||
++    payment.before!=std::array<uint32,4>{uint32(m_pp.copper),uint32(m_pp.silver),uint32(m_pp.gold),uint32(m_pp.platinum)}){
++  RejectMercenaryPersistence();return false;
++ }
++ m_pp.copper=payment.after[0];m_pp.silver=payment.after[1];m_pp.gold=payment.after[2];m_pp.platinum=payment.after[3];
++ if(fee){SendMoneyUpdate();RecalcWeight();}
++ return true;
++}
++
+ bool Merc::Unsuspend(bool setMaxStats) {
+ 
+ 	Client* mercOwner = nullptr;
+@@ -5465,6 +5515,7 @@
+ 	if(GetID())
+ 	{
+ 		const bool resuming = IsSuspended();
++		if (resuming && !mercOwner->SettleSpiritShroudMercenaryFee(this)) return false;
+ 		const bool reviving = resuming && mercOwner->GetMercInfo().hp <= 0;
+ 		const uint64 activation_cost = resuming && RuleB(Mercs, ChargeMercUpkeepCost) ?
+ 			static_cast<uint64>(CalcUpkeepCost(GetMercenaryTemplateID(), GetLevel())) * 100 : 0;
+--- a/zone/trading.cpp
++++ b/zone/trading.cpp
+@@ -110,6 +110,11 @@
+ 		return;
+ 	}
+ 
++	if(!client->CanTransferSpiritShroudItemTree(inst)){
++		client->Message(Chat::Yellow,"Your shroud's temporary supplies cannot be traded.");
++		return;
++	}
++
+ 	EQ::ItemInstance* inst2 = client->GetInv().GetItem(trade_slot_id);
+ 
+ 	// it looks like the original code attempted to allow stacking...
+@@ -323,6 +328,13 @@
+ void Client::FinishTrade(Mob* tradingWith, bool finalizer, void* event_entry, std::list<void*>* event_details) {
+ 	if (!tradingWith) {
+ 		return;
++	}
++
++	if(IsSpiritShrouded())for(int16 slot=EQ::invslot::TRADE_BEGIN;slot<=EQ::invslot::TRADE_END;++slot){
++		if(!CanTransferSpiritShroudItemTree(m_inv[slot])){
++			Message(Chat::Yellow,"Your shroud's temporary supplies cannot be transferred.");
++			ResetTrade();return;
++		}
+ 	}
+ 
+ 	if (tradingWith->IsClient()) {
+@@ -749,7 +761,7 @@
+ 		if (!inst)
+ 			continue;
+ 
+-		if (!inst->IsDroppable())
++		if (!CanTransferSpiritShroudItemTree(inst) || !inst->IsDroppable())
+ 			return true;
+ 	}
+ 
 --- a/zone/mob.h
 +++ b/zone/mob.h
 @@ -406,9 +406,9 @@
@@ -1492,8 +2445,91 @@
  		safe_delete(action_packet);
  		return false;
  	}
+@@ -6552,7 +6561,7 @@
+ //Thus I use this in the buff process to update the correct duration once after casting
+ //this allows AAs and focus effects that increase buff duration to work correctly, but could probably
+ //be used for other things as well
+-void Client::SendBuffDurationPacket(Buffs_Struct &buff, int slot)
++void Client::SendBuffDurationPacket(Buffs_Struct &buff, int slot, bool recreate)
+ {
+ 	EQApplicationPacket* outapp = nullptr;
+ 	outapp = new EQApplicationPacket(OP_Buff, sizeof(SpellBuffPacket_Struct));
+@@ -6581,7 +6590,9 @@
+ 	sbf->buff.z = buff.caston_z;
+ 
+ 	sbf->slotid = slot;
+-	sbf->bufffade = 0;
++	// Native alternate profiles begin with empty affects. RoF2 operation3
++	// installs the slot; the ordinary duration update cannot create it.
++	sbf->bufffade = recreate && ClientVersion() == EQ::versions::ClientVersion::RoF2 ? 3 : 0;
+ 	FastQueuePacket(&outapp);
+ }
+ 
 --- a/zone/zonedb.cpp
 +++ b/zone/zonedb.cpp
+@@ -465,7 +465,7 @@
+ #define StructDist(in, f1, f2) (uint32(&in->f2)-uint32(&in->f1))
+ 
+ bool ZoneDatabase::LoadCharacterData(uint32 character_id, PlayerProfile_Struct* pp, ExtendedProfile_Struct* m_epp){
+-	const auto& e = CharacterDataRepository::FindOne(database, character_id);
++	const auto& e = CharacterDataRepository::FindOne(*this, character_id);
+ 	if (!e.id) {
+ 		return false;
+ 	}
+@@ -579,7 +579,7 @@
+ bool ZoneDatabase::LoadCharacterMemmedSpells(uint32 character_id, PlayerProfile_Struct* pp)
+ {
+ 	const auto& l = CharacterMemmedSpellsRepository::GetWhere(
+-		database,
++		*this,
+ 		fmt::format(
+ 			"`id` = {} ORDER BY `slot_id`",
+ 			character_id
+@@ -602,7 +602,7 @@
+ bool ZoneDatabase::LoadCharacterSpellBook(uint32 character_id, PlayerProfile_Struct* pp)
+ {
+ 	const auto& l = CharacterSpellsRepository::GetWhere(
+-		database,
++		*this,
+ 		fmt::format(
+ 			"`id` = {} ORDER BY `slot_id`",
+ 			character_id
+@@ -760,7 +760,7 @@
+ bool ZoneDatabase::LoadCharacterMaterialColor(uint32 character_id, PlayerProfile_Struct* pp)
+ {
+ 	const auto& l = CharacterMaterialRepository::GetWhere(
+-		database,
++		*this,
+ 		fmt::format(
+ 			"`id` = {} LIMIT 9",
+ 			character_id
+@@ -780,7 +780,7 @@
+ bool ZoneDatabase::LoadCharacterBandolier(uint32 character_id, PlayerProfile_Struct* pp)
+ {
+ 	const auto& l = CharacterBandolierRepository::GetWhere(
+-		database,
++		*this,
+ 		fmt::format(
+ 			"`id` = {} LIMIT {}",
+ 			character_id,
+@@ -845,7 +845,7 @@
+ bool ZoneDatabase::LoadCharacterPotionBelt(uint32 character_id, PlayerProfile_Struct *pp)
+ {
+ 	const auto& l = CharacterPotionbeltRepository::GetWhere(
+-		database,
++		*this,
+ 		fmt::format(
+ 			"`id` = {} LIMIT {}",
+ 			character_id,
+@@ -877,7 +877,7 @@
+ bool ZoneDatabase::LoadCharacterBindPoint(uint32 character_id, PlayerProfile_Struct *pp)
+ {
+ 	const auto& l = CharacterBindRepository::GetWhere(
+-		database,
++		*this,
+ 		fmt::format(
+ 			"`id` = {} LIMIT 5",
+ 			character_id
 @@ -1060,6 +1060,7 @@
  	}
  
@@ -1502,6 +2538,45 @@
  
  	clock_t t = std::clock(); /* Function timer start */
  
+@@ -2410,11 +2411,12 @@
+ 	std::string table_list = "'mercs','merc_buffs','character_currency'";
+ 	if (payment->alternate) table_list += ",'character_alt_currency'";
+ 	if (initial_hire) table_list += ",'group_id'";
++	if (initial_hire && c->IsSpiritShrouded()) table_list += ",'spirit_shroud_mercenary_fees'";
+ 	auto engines = QueryDatabase(fmt::format(
+ 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() "
+ 		"AND table_name IN ({}) AND engine='InnoDB'", table_list), false);
+ 	if (!engines.Success() || engines.RowCount() != 1 || !engines.begin()[0] ||
+-		std::stoul(engines.begin()[0]) != (3 + (payment->alternate ? 1 : 0) + (initial_hire ? 1 : 0))) {
++		std::stoul(engines.begin()[0]) != (3 + (payment->alternate ? 1 : 0) + (initial_hire ? 1 : 0) + (initial_hire && c->IsSpiritShrouded() ? 1 : 0))) {
+ 		return Result::Failed;
+ 	}
+ 	auto e = MercsRepository::NewEntity();
+@@ -2561,6 +2563,24 @@
+ 		auto saved = QueryDatabase(sql, false);
+ 		if (!saved.Success()) { rollback(); return Result::Failed; }
+ 		if (!id) id = saved.LastInsertedID();
++		if (initial_hire && id && c->IsSpiritShrouded()) {
++			// Commit the later full original-level hire fee with the new contract.
++			// Existing contracts and ordinary hires never acquire this liability.
++			auto shroud = QueryDatabase(fmt::format(
++				"SELECT s.active_session_id,b.level FROM spirit_shroud_state s "
++				"JOIN spirit_shroud_sessions x ON x.id=s.active_session_id AND x.character_id=s.character_id AND x.phase='active' "
++				"JOIN shroud_original_character_data b ON b.id=s.character_id "
++				"WHERE s.character_id={} AND s.template_id<>0 FOR UPDATE", c->CharacterID()), false);
++			if (!shroud.Success() || shroud.RowCount()!=1 || !shroud.begin()[0] || !shroud.begin()[1]) { rollback(); return Result::Failed; }
++			const auto original_level = Strings::ToUnsignedInt(shroud.begin()[1]);
++			if (!original_level || original_level>255) { rollback(); return Result::Failed; }
++			const uint64 fee = RuleB(Mercs, ChargeMercPurchaseCost) ?
++				uint64(Merc::CalcPurchaseCost(m->GetMercenaryTemplateID(), original_level))*100 : 0;
++			auto recorded = QueryDatabase(fmt::format(
++				"INSERT INTO spirit_shroud_mercenary_fees(merc_id,character_id,session_id,template_id,original_level,fee_copper) "
++				"VALUES ({},{},{},{},{},{})", id,c->CharacterID(),shroud.begin()[0],m->GetMercenaryTemplateID(),original_level,fee), false);
++			if (!recorded.Success() || recorded.RowsAffected()!=1) { rollback(); return Result::Failed; }
++		}
+ 		if (initial_hire && id) {
+ 			auto joined = QueryDatabase(fmt::format(
+ 				"INSERT INTO group_id (group_id,name,character_id,bot_id,merc_id) VALUES ({},'{}',0,0,{})",
 --- a/zone/zonedb.h
 +++ b/zone/zonedb.h
 @@ -589,7 +589,8 @@
